@@ -2,3 +2,4 @@ fastapi==0.141.1
 uvicorn[standard]==0.52.4
 pytest==9.1.1
 httpx>=0.28,<1
+streamlit==1.62.0
