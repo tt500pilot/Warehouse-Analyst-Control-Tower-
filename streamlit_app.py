@@ -9,6 +9,7 @@ import pandas as pd
 import streamlit as st
 
 from app.ui.api_client import ControlTowerAPIError, get_json
+from app.ui.dataframe import make_frame
 
 
 st.set_page_config(
@@ -40,17 +41,6 @@ def money(value: Any) -> str:
         return f"${float(value):,.0f}"
     except (TypeError, ValueError):
         return "$0"
-
-
-def make_frame(records: list[dict[str, Any]]) -> pd.DataFrame:
-    if not records:
-        return pd.DataFrame()
-    frame = pd.DataFrame(records)
-    if "reasons" in frame.columns:
-        frame["reasons"] = frame["reasons"].apply(
-            lambda value: " • ".join(value) if isinstance(value, list) else value
-        )
-    return frame
 
 
 def show_connection_banner(base_url: str) -> None:
