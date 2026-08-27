@@ -1,0 +1,1 @@
+"""AWIA FastAPI application package."""
