@@ -1,11 +1,12 @@
 # Warehouse Analyst Control Tower (AWIA)
 
-AWIA is a warehouse analytics and decision-support API that connects to Odoo and provides the foundation for the Agentic Warehouse Inventory Analyst.
+AWIA is a warehouse analytics and decision-support application that connects to Odoo and provides the foundation for the Agentic Warehouse Inventory Analyst.
 
 ## Current capabilities
 
 - Production-oriented Odoo XML-RPC client validated against local Odoo 19.
 - FastAPI service with health checks and interactive OpenAPI docs.
+- Streamlit Control Tower UI that consumes the FastAPI service.
 - Read endpoints for products, inventory quants, stock move lines, and manufacturing orders.
 - Module A inventory-health scoring and advisory cycle-count planning.
 
@@ -31,6 +32,8 @@ git pull origin main
 python -m pip install -r .\requirements.txt
 ```
 
+Configure Odoo in the PowerShell window that will run FastAPI:
+
 ```powershell
 $env:ODOO_URL="http://localhost:8069"
 $env:ODOO_DB="scm_os_demo"
@@ -45,15 +48,54 @@ $env:ODOO_ALLOW_INSECURE_HTTP="true"
 python -m pytest -q
 ```
 
-Current expected result: 13 passing tests.
+Current expected result: 15 passing tests.
 
-## Run the API
+## Start FastAPI - Terminal 1
 
 ```powershell
+cd C:\Users\jamil\Projects\Warehouse-Analyst-Control-Tower-
+.\.venv\Scripts\Activate.ps1
+
+$env:ODOO_URL="http://localhost:8069"
+$env:ODOO_DB="scm_os_demo"
+$env:ODOO_USERNAME="admin"
+$env:ODOO_PASSWORD="admin"
+$env:ODOO_ALLOW_INSECURE_HTTP="true"
+
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Open `http://127.0.0.1:8000/docs`.
+FastAPI docs: `http://127.0.0.1:8000/docs`
+
+## Start Streamlit - Terminal 2
+
+Open a second PowerShell window while FastAPI remains running:
+
+```powershell
+cd C:\Users\jamil\Projects\Warehouse-Analyst-Control-Tower-
+.\.venv\Scripts\Activate.ps1
+python -m streamlit run .\streamlit_app.py --server.port 8501
+```
+
+Open the Control Tower at `http://localhost:8501`.
+
+The UI defaults to FastAPI at `http://127.0.0.1:8000`. To point it somewhere else:
+
+```powershell
+$env:AWIA_API_URL="http://127.0.0.1:8000"
+python -m streamlit run .\streamlit_app.py --server.port 8501
+```
+
+### Streamlit views
+
+- **Control Tower** - KPI cards, risk distribution, ABC distribution, and highest-risk locations.
+- **Inventory Health** - searchable/filterable Module A risk table with scoring methodology.
+- **Cycle Count Plan** - daily advisory count queue and route order.
+- **Data Explorer** - read-only inspection of products, quants, move lines, and manufacturing orders.
+
+The Streamlit UI talks only to FastAPI. Odoo credentials remain in the FastAPI process and are not exposed to the browser UI.
+
+## API endpoints
 
 Raw endpoints:
 - `GET /api/products?limit=100`
