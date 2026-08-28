@@ -131,3 +131,65 @@ def test_closed_session_metadata_retagging_is_blocked(tmp_path):
             session_id,
             route_algorithm_version="virtual-picker-nearest-neighbor-v1",
         )
+
+
+def test_normal_close_never_precedes_stage_complete(tmp_path):
+    base = datetime(2026, 8, 28, 13, 52, tzinfo=timezone.utc)
+    store = KittingEventStore(tmp_path / "events.sqlite3", now_provider=lambda: base)
+    session = store.start_session(SessionIdentity(picking_id=5))
+    session_id = session["session_id"]
+    staged_at = base + timedelta(minutes=7)
+    store.append_event(
+        session_id,
+        "stage_complete",
+        occurred_at=staged_at,
+        metadata={"simulator_version": "virtual-picker-nearest-neighbor-v1"},
+    )
+
+    closed = store.close_session(session_id, occurred_at=base + timedelta(minutes=5))
+
+    assert closed["closed_at"] == staged_at.isoformat()
+
+
+def test_repair_simulated_closed_session_uses_event_evidence(tmp_path):
+    base = datetime(2026, 8, 28, 13, 52, tzinfo=timezone.utc)
+    store = KittingEventStore(tmp_path / "events.sqlite3", now_provider=lambda: base)
+    session = store.start_session(
+        SessionIdentity(picking_id=5),
+        route_algorithm_version="manual-observed-v1",
+    )
+    session_id = session["session_id"]
+    staged_at = base + timedelta(minutes=7)
+    store.append_event(
+        session_id,
+        "item_scan",
+        occurred_at=base + timedelta(minutes=1),
+        product_code="FASTENER-900",
+        quantity=2,
+        metadata={"simulator_version": "virtual-picker-nearest-neighbor-v1"},
+    )
+    store.append_event(
+        session_id,
+        "stage_complete",
+        occurred_at=staged_at,
+        metadata={"simulator_version": "virtual-picker-nearest-neighbor-v1"},
+    )
+    store.close_session(session_id, occurred_at=staged_at)
+    with store._connect() as connection:
+        connection.execute(
+            "UPDATE kitting_sessions SET closed_at = ?, route_algorithm_version = ? WHERE session_id = ?",
+            (
+                (base + timedelta(minutes=5)).isoformat(),
+                "manual-observed-v1",
+                session_id,
+            ),
+        )
+    events_before = store.events_for_session(session_id)
+
+    repaired = store.repair_simulated_session(session_id)
+
+    assert repaired["session"]["route_algorithm_version"] == "virtual-picker-nearest-neighbor-v1"
+    assert repaired["session"]["closed_at"] == staged_at.isoformat()
+    assert repaired["repairs"]["route_algorithm_version"]["from"] == "manual-observed-v1"
+    assert repaired["event_history_changed"] is False
+    assert store.events_for_session(session_id) == events_before
