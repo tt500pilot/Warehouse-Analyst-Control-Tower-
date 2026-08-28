@@ -23,6 +23,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from app.services.kitting_instrumentation import KittingEventStore
+from app.services.kitting_observation_modes import set_observation_mode
 from app.services.virtual_picker import (
     PickerAssumptions,
     build_virtual_picker_plan,
@@ -96,11 +97,12 @@ def _fetch_reservations(
             value[0] if isinstance(value, (list, tuple)) else value
             for line in lines
             for value in [line.get("product_id")]
-            if isinstance(value, int)
+            if (isinstance(value, int) and not isinstance(value, bool))
             or (
                 isinstance(value, (list, tuple))
                 and value
                 and isinstance(value[0], int)
+                and not isinstance(value[0], bool)
             )
         }
     )
@@ -174,6 +176,7 @@ def simulate_picker(
         "database": client.database,
         "mode": "apply_events" if apply_events else "dry_run",
         "classification": "simulated_human_like",
+        "observation_mode": "simulated_virtual_picker",
         "criticality_source": "simulation_fixture_by_default_code",
         "session_id": session["session_id"],
         "picking": candidate,
@@ -193,9 +196,15 @@ def simulate_picker(
         str(session["session_id"]),
         route_algorithm_version=str(plan["simulator_version"]),
     )
+    session = set_observation_mode(
+        store,
+        str(session["session_id"]),
+        "simulated_virtual_picker",
+    )
     started_at = _parse_iso(str(session["started_at"]))
     metadata_base = {
         "classification": "simulated_human_like",
+        "observation_mode": "simulated_virtual_picker",
         "simulator_version": plan["simulator_version"],
         "seed": seed,
         "preproduction_proxy": plan["routing"]["preproduction_proxy"],
