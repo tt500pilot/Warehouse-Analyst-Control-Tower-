@@ -29,7 +29,6 @@ def test_session_records_observed_kitting_timing(tmp_path):
     store = _store(tmp_path)
     session = store.start_session(
         SessionIdentity(
-            session_id="ignored",
             picking_id=5,
             picking_name="WH/PC/00005",
             manufacturing_order="WH/MO/00005",
@@ -53,9 +52,25 @@ def test_session_records_observed_kitting_timing(tmp_path):
     assert report["summary"]["time_to_first_scan_minutes"] == 5.0
 
 
+def test_session_identity_does_not_require_session_id(tmp_path):
+    store = KittingEventStore(tmp_path / "events.sqlite3")
+    session = store.start_session(
+        SessionIdentity(
+            picking_id=5,
+            picking_name="WH/PC/00005",
+            manufacturing_order="WH/MO/00005",
+            awia_origin="AWIA-MOCK-MO-005",
+        )
+    )
+
+    assert session["picking_id"] == 5
+    assert isinstance(session["session_id"], str)
+    assert session["session_id"]
+
+
 def test_duplicate_active_session_for_picking_is_blocked(tmp_path):
     store = KittingEventStore(tmp_path / "events.sqlite3")
-    identity = SessionIdentity(session_id="ignored", picking_id=5)
+    identity = SessionIdentity(picking_id=5)
     store.start_session(identity)
 
     with pytest.raises(SessionStateError, match="already has an active/staged"):
@@ -64,7 +79,7 @@ def test_duplicate_active_session_for_picking_is_blocked(tmp_path):
 
 def test_normal_close_requires_stage_complete(tmp_path):
     store = KittingEventStore(tmp_path / "events.sqlite3")
-    session = store.start_session(SessionIdentity(session_id="ignored", picking_id=5))
+    session = store.start_session(SessionIdentity(picking_id=5))
 
     with pytest.raises(SessionStateError, match="stage_complete"):
         store.close_session(session["session_id"])
@@ -72,7 +87,7 @@ def test_normal_close_requires_stage_complete(tmp_path):
 
 def test_closed_session_rejects_new_events(tmp_path):
     store = KittingEventStore(tmp_path / "events.sqlite3")
-    session = store.start_session(SessionIdentity(session_id="ignored", picking_id=5))
+    session = store.start_session(SessionIdentity(picking_id=5))
     session_id = session["session_id"]
     store.append_event(session_id, "stage_complete")
     store.close_session(session_id)
