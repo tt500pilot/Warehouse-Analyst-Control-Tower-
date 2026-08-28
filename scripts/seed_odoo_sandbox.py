@@ -13,13 +13,22 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import sys
 from pathlib import Path
 from typing import Any
+
+# When this file is launched directly (``python scripts/seed_odoo_sandbox.py``),
+# Python places ``scripts/`` rather than the repository root on sys.path.
+# Add the repository root explicitly so root modules such as odoo_client and
+# the scripts package resolve the same way they do under pytest/module mode.
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from odoo_client import OdooWarehouseClient
 from scripts.generate_simulation_sandbox import generate
 
-DEFAULT_DATA_DIR = Path("data/simulation_sandbox")
+DEFAULT_DATA_DIR = ROOT_DIR / "data" / "simulation_sandbox"
 DEFAULT_ALLOWED_DATABASES = {"awia_mock", "awia_sandbox", "awia_test"}
 
 
