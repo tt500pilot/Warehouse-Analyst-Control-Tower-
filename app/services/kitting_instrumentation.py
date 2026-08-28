@@ -193,6 +193,42 @@ class KittingEventStore:
             ) from exc
         return self.get_session(session_id)
 
+    def update_session_metadata(
+        self,
+        session_id: str,
+        *,
+        operator: str | None = None,
+        layout_version: str | None = None,
+        route_algorithm_version: str | None = None,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        """Correct non-transactional session labels without altering event history.
+
+        Intended for metadata such as simulator/operator/version tags.  Timestamps,
+        status, picking identity, and event rows are deliberately immutable here.
+        """
+        session = self.get_session(session_id)
+        if session["status"] in {"closed", "cancelled"}:
+            raise SessionStateError(
+                f"Session {session_id} is {session['status']!r}; metadata can only be changed while active/staged."
+            )
+        values = {
+            "operator": operator,
+            "layout_version": layout_version,
+            "route_algorithm_version": route_algorithm_version,
+            "notes": notes,
+        }
+        updates = {key: value for key, value in values.items() if value is not None}
+        if not updates:
+            return session
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        with self._connect() as connection:
+            connection.execute(
+                f"UPDATE kitting_sessions SET {assignments} WHERE session_id = ?",
+                [*updates.values(), session_id],
+            )
+        return self.get_session(session_id)
+
     def append_event(
         self,
         session_id: str,
