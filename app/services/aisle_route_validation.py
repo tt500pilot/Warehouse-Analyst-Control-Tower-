@@ -1,11 +1,13 @@
 """Matched route-level validation for mapped-aisle slotting recommendations.
 
-Uses historical Odoo picking groups plus validated AWIA legal-path geometry to
-compare the same modeled transfers before/after advisory slot changes. The only
-changed variable is the access node assigned to recommended product lines.
+Uses Odoo picking groups plus validated AWIA legal-path geometry to compare the
+same modeled transfers before/after advisory slot changes. Completed move lines
+(`state == done`) are the primary historical-validation cohort. Open/planned
+move lines are reported separately and never mixed into the primary result.
 
-This is still a modeled route, not observed human labor. It improves on
-independent-touch arithmetic by accounting for co-picks and shared source nodes.
+This is still a modeled aisle subroute, not observed human labor or whole-kit
+warehouse travel. It improves on independent-touch arithmetic by accounting for
+co-picks and shared source nodes within the mapped aisle.
 """
 
 from __future__ import annotations
@@ -78,69 +80,17 @@ def _route(
         }
     )
     total += return_distance
-    return {
-        "distance_ft": round(total, 3),
-        "legs": legs,
-    }
+    return {"distance_ft": round(total, 3), "legs": legs}
 
 
-def evaluate_matched_route_impact(
-    geometry: Record,
-    moves: Iterable[Record],
-    recommendations: Iterable[Record],
+def _evaluate_grouped(
+    grouped: Mapping[int, list[dict[str, Any]]],
+    *,
+    adjacency: Mapping[str, list[tuple[str, float]]],
+    anchor_node: str,
+    locations: Mapping[int, Record],
+    recommendation_by_product: Mapping[int, dict[str, Any]],
 ) -> dict[str, Any]:
-    if geometry.get("schema_version") != "awia-warehouse-geometry-v1":
-        raise ValueError("Unsupported or missing canonical geometry schema_version")
-
-    anchor = geometry.get("anchor") or {}
-    anchor_name = str(anchor.get("complete_name") or "")
-    anchor_node = str(anchor.get("graph_node_id") or "")
-    if not anchor_name or not anchor_node:
-        raise ValueError("Canonical geometry anchor is incomplete")
-
-    node_rows = list((geometry.get("graph") or {}).get("nodes") or [])
-    edge_rows = list((geometry.get("graph") or {}).get("edges") or [])
-    adjacency = build_adjacency(node_rows, edge_rows)
-
-    locations = {
-        int(row["odoo_location_id"]): row
-        for row in geometry.get("locations", [])
-        if row.get("record_type") == "storage_bin" and row.get("odoo_location_id") is not None
-    }
-    recommendation_by_product: dict[int, dict[str, Any]] = {}
-    for row in recommendations:
-        product_id = row.get("product_id")
-        candidate = row.get("candidate") or {}
-        if product_id is None or candidate.get("odoo_location_id") is None:
-            continue
-        recommendation_by_product[int(product_id)] = dict(row)
-
-    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    eligible_move_lines = 0
-    move_lines_without_picking = 0
-    for move in moves:
-        source_id = _m2o_id(move.get("location_id"))
-        if source_id not in locations:
-            continue
-        if _m2o_name(move.get("location_dest_id")) != anchor_name:
-            continue
-        eligible_move_lines += 1
-        picking_id = _m2o_id(move.get("picking_id"))
-        if picking_id is None:
-            move_lines_without_picking += 1
-            continue
-        product_id = _m2o_id(move.get("product_id"))
-        if product_id is None:
-            continue
-        grouped[picking_id].append(
-            {
-                "move_line_id": _m2o_id(move.get("id")),
-                "product_id": product_id,
-                "source_location_id": source_id,
-                "source_node": str(locations[source_id]["graph_node_id"]),
-            }
-        )
-
     per_picking: list[dict[str, Any]] = []
     total_baseline = 0.0
     total_candidate = 0.0
@@ -154,6 +104,7 @@ def evaluate_matched_route_impact(
         baseline_nodes = {row["source_node"] for row in lines}
         candidate_nodes: set[str] = set()
         affected_products: list[int] = []
+
         for line in lines:
             recommendation = recommendation_by_product.get(line["product_id"])
             if recommendation is None:
@@ -199,7 +150,7 @@ def evaluate_matched_route_impact(
         )
 
     total_saved = total_baseline - total_candidate
-    recommendation_rows: list[dict[str, Any]] = []
+    recommendation_rows = []
     for product_id, recommendation in sorted(
         recommendation_by_product.items(),
         key=lambda item: int(item[1].get("rank") or 999999),
@@ -230,25 +181,9 @@ def evaluate_matched_route_impact(
     ]
 
     return {
-        "mode": "matched_historical_picking_route_simulation",
-        "classification": "modeled_not_observed_human",
-        "odoo_mutated": False,
-        "anchor": anchor,
-        "methodology": {
-            "grouping": "historical Odoo stock.move.line rows grouped by picking_id",
-            "scope": "mapped-aisle source lines whose destination is the geometry anchor",
-            "baseline": "nearest-neighbor route over unique current access nodes, returning to anchor",
-            "candidate": "same picking lines and graph, with recommended products remapped to candidate access nodes",
-            "important": "shared/co-picked nodes are visited once per modeled picking, preventing independent-touch double counting",
-        },
-        "coverage": {
-            "eligible_move_lines": eligible_move_lines,
-            "move_lines_with_picking_id": eligible_move_lines - move_lines_without_picking,
-            "move_lines_without_picking_id_excluded": move_lines_without_picking,
-            "modeled_pickings": len(per_picking),
-            "affected_pickings": affected_pickings,
-            "pickings_with_multiple_recommended_products": co_pick_overlap_pickings,
-        },
+        "modeled_pickings": len(per_picking),
+        "affected_pickings": affected_pickings,
+        "pickings_with_multiple_recommended_products": co_pick_overlap_pickings,
         "result": {
             "baseline_total_distance_ft": round(total_baseline, 3),
             "candidate_total_distance_ft": round(total_candidate, 3),
@@ -260,9 +195,123 @@ def evaluate_matched_route_impact(
         "recommendation_coverage": recommendation_rows,
         "recommended_product_co_pick_pairs": co_pick_pairs,
         "per_picking": per_picking,
+    }
+
+
+def evaluate_matched_route_impact(
+    geometry: Record,
+    moves: Iterable[Record],
+    recommendations: Iterable[Record],
+) -> dict[str, Any]:
+    if geometry.get("schema_version") != "awia-warehouse-geometry-v1":
+        raise ValueError("Unsupported or missing canonical geometry schema_version")
+
+    anchor = geometry.get("anchor") or {}
+    anchor_name = str(anchor.get("complete_name") or "")
+    anchor_node = str(anchor.get("graph_node_id") or "")
+    if not anchor_name or not anchor_node:
+        raise ValueError("Canonical geometry anchor is incomplete")
+
+    node_rows = list((geometry.get("graph") or {}).get("nodes") or [])
+    edge_rows = list((geometry.get("graph") or {}).get("edges") or [])
+    adjacency = build_adjacency(node_rows, edge_rows)
+
+    locations = {
+        int(row["odoo_location_id"]): row
+        for row in geometry.get("locations", [])
+        if row.get("record_type") == "storage_bin" and row.get("odoo_location_id") is not None
+    }
+    recommendation_by_product: dict[int, dict[str, Any]] = {}
+    for row in recommendations:
+        product_id = row.get("product_id")
+        candidate = row.get("candidate") or {}
+        if product_id is None or candidate.get("odoo_location_id") is None:
+            continue
+        recommendation_by_product[int(product_id)] = dict(row)
+
+    grouped_done: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    grouped_open: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    eligible_move_lines = 0
+    move_lines_without_picking = 0
+    done_move_lines = 0
+    open_move_lines = 0
+    state_counts: dict[str, int] = defaultdict(int)
+
+    for move in moves:
+        source_id = _m2o_id(move.get("location_id"))
+        if source_id not in locations:
+            continue
+        if _m2o_name(move.get("location_dest_id")) != anchor_name:
+            continue
+        eligible_move_lines += 1
+        state = str(move.get("state") or "unknown").strip().lower() or "unknown"
+        state_counts[state] += 1
+        picking_id = _m2o_id(move.get("picking_id"))
+        if picking_id is None:
+            move_lines_without_picking += 1
+            continue
+        product_id = _m2o_id(move.get("product_id"))
+        if product_id is None:
+            continue
+        row = {
+            "move_line_id": _m2o_id(move.get("id")),
+            "product_id": product_id,
+            "source_location_id": source_id,
+            "source_node": str(locations[source_id]["graph_node_id"]),
+            "state": state,
+        }
+        if state == "done":
+            grouped_done[picking_id].append(row)
+            done_move_lines += 1
+        else:
+            grouped_open[picking_id].append(row)
+            open_move_lines += 1
+
+    completed = _evaluate_grouped(
+        grouped_done,
+        adjacency=adjacency,
+        anchor_node=anchor_node,
+        locations=locations,
+        recommendation_by_product=recommendation_by_product,
+    )
+    planned = _evaluate_grouped(
+        grouped_open,
+        adjacency=adjacency,
+        anchor_node=anchor_node,
+        locations=locations,
+        recommendation_by_product=recommendation_by_product,
+    )
+
+    return {
+        "mode": "matched_mapped_aisle_route_simulation",
+        "classification": "modeled_not_observed_human",
+        "odoo_mutated": False,
+        "anchor": anchor,
+        "methodology": {
+            "primary_validation_cohort": "completed stock.move.line rows only (state=done)",
+            "planned_cohort": "non-done move lines reported separately and excluded from primary historical result",
+            "grouping": "Odoo stock.move.line rows grouped by picking_id within each state cohort",
+            "scope": "mapped-aisle source lines whose destination is the geometry anchor; this is an aisle subroute, not whole-warehouse kit travel",
+            "baseline": "nearest-neighbor route over unique current access nodes, returning to anchor",
+            "candidate": "same picking lines and graph, with recommended products remapped to candidate access nodes",
+            "important": "shared/co-picked nodes are visited once per modeled picking, preventing independent-touch double counting",
+        },
+        "coverage": {
+            "eligible_move_lines": eligible_move_lines,
+            "move_lines_with_picking_id": eligible_move_lines - move_lines_without_picking,
+            "move_lines_without_picking_id_excluded": move_lines_without_picking,
+            "state_counts": dict(sorted(state_counts.items())),
+            "completed_move_lines_used": done_move_lines,
+            "planned_or_open_move_lines_separated": open_move_lines,
+            "completed_modeled_pickings": completed["modeled_pickings"],
+            "planned_modeled_pickings": planned["modeled_pickings"],
+        },
+        "completed_historical_validation": completed,
+        "planned_or_open_simulation": planned,
+        "primary_result": completed["result"],
         "guardrails": [
-            "This is a deterministic modeled route, not measured picker behavior or labor time.",
+            "Primary result uses completed move lines only; open/planned lines are never mixed into historical validation.",
+            "This is a deterministic modeled aisle subroute, not measured picker behavior, labor time, or whole-kit warehouse travel.",
             "Candidate relocation feasibility, capacity, reservations, traceability, and approval remain separate gates.",
-            "Only historical move lines with a picking_id are included in matched trip analysis.",
         ],
     }
