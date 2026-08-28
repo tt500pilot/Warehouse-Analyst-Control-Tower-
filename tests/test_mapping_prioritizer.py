@@ -19,6 +19,13 @@ def test_derive_logical_area_uses_flat_aisle_fallback() -> None:
     )
 
 
+def test_derive_logical_area_looks_through_generic_mock_container() -> None:
+    assert derive_logical_area("WH/Stock/AWIA Mock/H-04-L1-BA") == (
+        "WH/Stock/AWIA Mock/Aisle H",
+        "nested_flat_aisle_prefix",
+    )
+
+
 def test_mapping_prioritizer_ranks_high_activity_critical_area_first() -> None:
     products = [
         {
@@ -90,3 +97,53 @@ def test_mapping_prioritizer_ranks_high_activity_critical_area_first() -> None:
     assert result["areas"][0]["move_touches"] == 10
     assert result["areas"][0]["flight_critical_skus"] == 1
     assert result["methodology"]["physical_distance"].startswith("not used")
+
+
+def test_non_stock_quant_location_is_flow_endpoint_not_ranked_storage() -> None:
+    products = [
+        {
+            "id": 1,
+            "default_code": "P-1",
+            "name": "Part",
+            "standard_price": 100.0,
+            "tracking": "lot",
+            "x_is_flight_critical": False,
+        }
+    ]
+    locations = [
+        {"id": 101, "complete_name": "WH/Stock/AWIA Mock/H-01-L1-BA", "usage": "internal"},
+        {"id": 201, "complete_name": "WH/Pre-Production", "usage": "internal"},
+        {"id": 301, "complete_name": "Inventory adjustment", "usage": "inventory"},
+    ]
+    quants = [
+        {"id": 1, "product_id": [1, "Part"], "location_id": [101, "WH/Stock/AWIA Mock/H-01-L1-BA"], "quantity": 20.0, "reserved_quantity": 0.0},
+        {"id": 2, "product_id": [1, "Part"], "location_id": [201, "WH/Pre-Production"], "quantity": 2.0, "reserved_quantity": 2.0},
+        {"id": 3, "product_id": [1, "Part"], "location_id": [301, "Inventory adjustment"], "quantity": -22.0, "reserved_quantity": 0.0},
+    ]
+    moves = [
+        {
+            "id": 1,
+            "product_id": [1, "Part"],
+            "location_id": [101, "WH/Stock/AWIA Mock/H-01-L1-BA"],
+            "location_dest_id": [201, "WH/Pre-Production"],
+            "quantity": 2.0,
+            "date": (NOW - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    ]
+
+    result = analyze_mapping_priorities(
+        products,
+        quants,
+        moves,
+        locations,
+        as_of=NOW,
+        lookback_days=90,
+    )
+
+    assert [row["logical_area"] for row in result["areas"]] == [
+        "WH/Stock/AWIA Mock/Aisle H"
+    ]
+    assert result["summary"]["quant_locations_excluded_from_storage_ranking"] == 2
+    assert result["areas"][0]["top_flow_counterparts"] == [
+        {"location": "WH/Pre-Production", "touches": 1}
+    ]
