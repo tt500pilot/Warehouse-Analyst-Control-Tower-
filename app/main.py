@@ -12,6 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, status
 from app.services.inventory_health import analyze_inventory_health, build_cycle_count_plan
 from app.services.kitting_baseline import analyze_kitting_baseline
 from app.services.kitting_transactions import inspect_kitting_transactions
+from app.services.mapping_prioritizer import analyze_mapping_priorities
 from odoo_client import OdooClientError, OdooWarehouseClient
 
 logger = logging.getLogger(__name__)
@@ -23,7 +24,7 @@ app = FastAPI(
         "connected to Odoo. Operational mutations remain outside this API until "
         "they are protected by explicit human-in-the-loop approval workflows."
     ),
-    version="0.5.1",
+    version="0.6.0",
 )
 
 ANALYSIS_PRODUCT_FIELDS = (
@@ -150,6 +151,79 @@ def _build_inventory_health_report(client: OdooWarehouseClient, *, source_limit:
         "move_lines_28d": len(moves),
         "source_limit_per_model": source_limit,
         "truncated_possible": any(len(records) >= source_limit for records in (products, quants, moves)),
+    }
+    return report
+
+
+def _build_mapping_priority_report(
+    client: OdooWarehouseClient,
+    *,
+    source_limit: int,
+    lookback_days: int,
+) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=lookback_days)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        products = client.fetch_products(
+            domain=[["active", "=", True]],
+            fields=ANALYSIS_PRODUCT_FIELDS,
+            limit=source_limit,
+        )
+        quants = client.fetch_stock_quants(
+            domain=[["quantity", "!=", 0]],
+            limit=source_limit,
+        )
+        moves = client.fetch_stock_move_lines(
+            domain=[["date", ">=", cutoff]],
+            limit=source_limit,
+        )
+        location_fields = client._resolve_fields(
+            "stock.location",
+            ("id", "complete_name", "display_name", "name", "usage", "barcode"),
+            ("id", "complete_name", "display_name", "name", "usage", "barcode"),
+        )
+        locations = client.search_read(
+            "stock.location",
+            domain=[["usage", "=", "internal"]],
+            fields=location_fields,
+            limit=source_limit,
+            order="id asc",
+        )
+        bom_line_fields = client._resolve_fields(
+            "mrp.bom.line",
+            ("id", "bom_id", "product_id", "product_qty", "active"),
+            ("id", "bom_id", "product_id", "product_qty", "active"),
+        )
+        bom_lines = client.search_read(
+            "mrp.bom.line",
+            domain=[],
+            fields=bom_line_fields,
+            limit=source_limit,
+            order="id asc",
+        )
+    except OdooClientError as exc:
+        raise _odoo_unavailable(exc) from exc
+
+    report = analyze_mapping_priorities(
+        products,
+        quants,
+        moves,
+        locations,
+        bom_lines=bom_lines,
+        as_of=now,
+        lookback_days=lookback_days,
+    )
+    report["source_snapshot"] = {
+        "products": len(products),
+        "quants": len(quants),
+        "move_lines": len(moves),
+        "locations": len(locations),
+        "bom_lines": len(bom_lines),
+        "source_limit_per_model": source_limit,
+        "truncated_possible": any(
+            len(records) >= source_limit
+            for records in (products, quants, moves, locations, bom_lines)
+        ),
     }
     return report
 
@@ -341,6 +415,7 @@ def root() -> dict[str, Any]:
             "odoo_health": "/health/odoo",
             "inventory_health": "/api/inventory-health",
             "cycle_count_plan": "/api/cycle-count-plan",
+            "mapping_priorities": "/api/mapping-priorities",
             "kitting_baseline": "/api/kitting-baseline",
             "kitting_transactions": "/api/kitting-transactions",
             "docs": "/docs",
@@ -382,6 +457,23 @@ def stock_moves(limit: int = Query(default=100, ge=1, le=5000), client: OdooWare
 @app.get("/api/manufacturing-orders", tags=["manufacturing"])
 def manufacturing_orders(limit: int = Query(default=100, ge=1, le=5000), client: OdooWarehouseClient = Depends(get_odoo_client)) -> dict[str, Any]:
     return _fetch_records(client.fetch_manufacturing_orders, limit)
+
+
+@app.get("/api/mapping-priorities", tags=["warehouse", "analytics"])
+def mapping_priorities(
+    limit: int = Query(default=10, ge=1, le=100),
+    source_limit: int = Query(default=5000, ge=100, le=20000),
+    lookback_days: int = Query(default=90, ge=7, le=365),
+    client: OdooWarehouseClient = Depends(get_odoo_client),
+) -> dict[str, Any]:
+    report = _build_mapping_priority_report(
+        client,
+        source_limit=source_limit,
+        lookback_days=lookback_days,
+    )
+    report["areas"] = report["areas"][:limit]
+    report["returned_areas"] = len(report["areas"])
+    return report
 
 
 @app.get("/api/kitting-transactions", tags=["manufacturing", "analytics"])
