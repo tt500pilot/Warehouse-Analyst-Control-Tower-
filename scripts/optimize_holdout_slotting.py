@@ -1,9 +1,9 @@
-"""Evaluate current vs candidate slotting for untouched AWIA holdout pickings.
+"""Train AWIA slotting on completed baseline kits and score untouched holdouts.
 
 This command is read-only with respect to Odoo and the instrumentation sidecar.
-It reads current reservations for the requested open Pick Components transfers,
-builds a candidate product-to-bin assignment, and runs the same deterministic
-virtual-picker model against mock-v1 and the candidate assignment.
+The candidate layout is learned only from completed baseline Pick Components
+transfers (default 5-8). Untouched open transfers (default 9-12) are then used
+strictly for evaluation, preventing training/holdout leakage.
 """
 
 from __future__ import annotations
@@ -33,40 +33,64 @@ from scripts.check_kitting_execution_readiness import build_readiness_report
 from scripts.simulate_virtual_picker import _fetch_reservations
 
 DEFAULT_DATA_DIR = ROOT_DIR / "data" / "simulation_sandbox"
+DEFAULT_TRAINING = (5, 6, 7, 8)
 DEFAULT_HOLDOUTS = (9, 10, 11, 12)
 
 
-def _validate_holdouts(report: dict[str, Any], picking_ids: tuple[int, ...]) -> None:
+def _picking_index(report: dict[str, Any]) -> dict[int, dict[str, Any]]:
     by_id: dict[int, dict[str, Any]] = {}
     for transaction in report.get("transactions", []):
         for picking in transaction.get("pick_component_transfers", []):
             picking_id = picking.get("picking_id")
             if isinstance(picking_id, int) and not isinstance(picking_id, bool):
                 by_id[picking_id] = picking
+    return by_id
 
-    missing = [picking_id for picking_id in picking_ids if picking_id not in by_id]
+
+def _validate_experiment(
+    report: dict[str, Any],
+    training_ids: tuple[int, ...],
+    holdout_ids: tuple[int, ...],
+) -> None:
+    overlap = set(training_ids) & set(holdout_ids)
+    if overlap:
+        raise RuntimeError(f"Training and holdout IDs overlap: {sorted(overlap)}")
+
+    by_id = _picking_index(report)
+    missing = [picking_id for picking_id in (*training_ids, *holdout_ids) if picking_id not in by_id]
     if missing:
-        raise RuntimeError(f"Holdout Pick Components transfers not found: {missing}")
+        raise RuntimeError(f"Pick Components transfers not found: {missing}")
 
-    invalid: list[dict[str, Any]] = []
-    for picking_id in picking_ids:
+    invalid_training = [
+        {"picking_id": picking_id, "state": by_id[picking_id].get("state")}
+        for picking_id in training_ids
+        if by_id[picking_id].get("state") != "done"
+    ]
+    if invalid_training:
+        raise RuntimeError(
+            "Training transfers must already be completed so they cannot be influenced by the experiment: "
+            + json.dumps(invalid_training, sort_keys=True)
+        )
+
+    invalid_holdouts: list[dict[str, Any]] = []
+    for picking_id in holdout_ids:
         picking = by_id[picking_id]
         if picking.get("state") != "assigned" or not picking.get("execution_ready"):
-            invalid.append(
+            invalid_holdouts.append(
                 {
                     "picking_id": picking_id,
                     "state": picking.get("state"),
                     "execution_ready": picking.get("execution_ready"),
                 }
             )
-    if invalid:
+    if invalid_holdouts:
         raise RuntimeError(
-            "Holdout experiment requires all requested transfers to remain assigned and execution-ready: "
-            + json.dumps(invalid, sort_keys=True)
+            "Holdout transfers must remain assigned and execution-ready: "
+            + json.dumps(invalid_holdouts, sort_keys=True)
         )
 
 
-def build_holdout_reservations(
+def build_reservations(
     client: OdooWarehouseClient,
     picking_ids: tuple[int, ...],
     data_dir: Path,
@@ -77,59 +101,71 @@ def build_holdout_reservations(
 
     for picking_id in picking_ids:
         lines, product_by_id = _fetch_reservations(client, picking_id=picking_id)
-        reservations_by_picking[picking_id] = enrich_reservation_lines(
+        reservations = enrich_reservation_lines(
             lines,
             product_by_id,
             geometry,
             simulation_product_by_code=simulation_product_by_code,
         )
+        if not reservations:
+            raise RuntimeError(f"Picking {picking_id} returned no component move lines for simulation.")
+        reservations_by_picking[picking_id] = reservations
     return reservations_by_picking, geometry
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare mock-v1 to a read-only optimized slotting candidate for untouched AWIA holdouts."
+        description="Train mock-v2 slotting on completed baseline kits and score untouched holdouts."
     )
     parser.add_argument(
-        "--picking-ids",
+        "--training-picking-ids",
+        nargs="+",
+        type=int,
+        default=list(DEFAULT_TRAINING),
+        help="Completed baseline picking IDs; defaults to 5 6 7 8.",
+    )
+    parser.add_argument(
+        "--holdout-picking-ids",
         nargs="+",
         type=int,
         default=list(DEFAULT_HOLDOUTS),
-        help="Holdout picking IDs; defaults to 9 10 11 12.",
+        help="Untouched holdout picking IDs; defaults to 9 10 11 12.",
     )
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--walking-speed-ft-s", type=float, default=3.5)
     args = parser.parse_args()
 
-    picking_ids = tuple(dict.fromkeys(args.picking_ids))
-    if not picking_ids:
-        raise ValueError("At least one picking ID is required.")
+    training_ids = tuple(dict.fromkeys(args.training_picking_ids))
+    holdout_ids = tuple(dict.fromkeys(args.holdout_picking_ids))
+    if not training_ids or not holdout_ids:
+        raise ValueError("Both training and holdout picking IDs are required.")
 
     client = OdooWarehouseClient.from_env()
     readiness = build_readiness_report(client)
-    _validate_holdouts(readiness, picking_ids)
+    _validate_experiment(readiness, training_ids, holdout_ids)
+
     data_dir = Path(args.data_dir)
-    reservations_by_picking, geometry = build_holdout_reservations(
-        client,
-        picking_ids,
-        data_dir,
-    )
+    training_reservations, geometry = build_reservations(client, training_ids, data_dir)
+    holdout_reservations, _ = build_reservations(client, holdout_ids, data_dir)
     assumptions = PickerAssumptions(walking_speed_ft_s=args.walking_speed_ft_s)
     product_metadata = load_slotting_product_metadata(data_dir)
 
     result = optimize_slotting_layout(
-        reservations_by_picking,
+        training_reservations,
+        holdout_reservations,
         geometry,
         product_metadata,
         assumptions=assumptions,
         seed=args.seed,
     )
     result["database"] = client.database
-    result["holdout_picking_ids"] = list(picking_ids)
-    result["holdout_preflight"] = {
-        "requested": len(picking_ids),
-        "all_requested_assigned_and_execution_ready": True,
+    result["preflight"] = {
+        "training_picking_ids": list(training_ids),
+        "training_all_done": True,
+        "holdout_picking_ids": list(holdout_ids),
+        "holdouts_all_assigned_and_execution_ready": True,
+        "training_holdout_overlap": False,
         "odoo_writes": False,
         "instrumentation_writes": False,
     }
