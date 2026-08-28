@@ -149,6 +149,8 @@ def main() -> None:
         "--readiness", str(readiness),
         "--economics", str(economics),
         "--decision", str(decision),
+        "--copick-package-economics", str(copick_packages),
+        "--copick-package-decision", str(copick_package_decision),
         "--geometry", str(geometry),
         "--output-markdown", str(report_md),
         "--output-json", str(report_json),
