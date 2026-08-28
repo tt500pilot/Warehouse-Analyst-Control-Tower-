@@ -10,6 +10,7 @@ from typing import Any, Callable
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 
 from app.services.inventory_health import analyze_inventory_health, build_cycle_count_plan
+from app.services.kitting_baseline import analyze_kitting_baseline
 from odoo_client import OdooClientError, OdooWarehouseClient
 
 logger = logging.getLogger(__name__)
@@ -21,7 +22,7 @@ app = FastAPI(
         "connected to Odoo. Operational mutations remain outside this API until "
         "they are protected by explicit human-in-the-loop approval workflows."
     ),
-    version="0.3.0",
+    version="0.4.0",
 )
 
 ANALYSIS_PRODUCT_FIELDS = (
@@ -31,6 +32,33 @@ ANALYSIS_PRODUCT_FIELDS = (
     "standard_price",
     "tracking",
     "x_is_flight_critical",
+)
+
+KITTING_PICKING_FIELDS = (
+    "id",
+    "name",
+    "origin",
+    "picking_type_id",
+    "location_id",
+    "location_dest_id",
+    "create_date",
+    "scheduled_date",
+    "date_done",
+    "state",
+    "user_id",
+)
+
+KITTING_MOVE_FIELDS = (
+    "id",
+    "picking_id",
+    "product_id",
+    "location_id",
+    "location_dest_id",
+    "quantity",
+    "qty_done",
+    "date",
+    "state",
+    "write_uid",
 )
 
 
@@ -76,6 +104,49 @@ def _build_inventory_health_report(client: OdooWarehouseClient, *, source_limit:
     return report
 
 
+def _build_kitting_baseline_report(
+    client: OdooWarehouseClient,
+    *,
+    source_limit: int,
+    picking_type_contains: str,
+) -> dict[str, Any]:
+    try:
+        picking_fields = client._resolve_fields("stock.picking", KITTING_PICKING_FIELDS, KITTING_PICKING_FIELDS)
+        move_fields = client._resolve_fields("stock.move.line", KITTING_MOVE_FIELDS, KITTING_MOVE_FIELDS)
+        pickings = client.search_read(
+            "stock.picking",
+            domain=[["state", "=", "done"]],
+            fields=picking_fields,
+            limit=source_limit,
+            order="date_done desc, id desc",
+        )
+        picking_ids = [record["id"] for record in pickings if isinstance(record.get("id"), int)]
+        moves = []
+        if picking_ids:
+            moves = client.search_read(
+                "stock.move.line",
+                domain=[["picking_id", "in", picking_ids]],
+                fields=move_fields,
+                limit=source_limit,
+                order="date asc, id asc",
+            )
+    except OdooClientError as exc:
+        raise _odoo_unavailable(exc) from exc
+
+    report = analyze_kitting_baseline(
+        pickings,
+        moves,
+        picking_type_contains=picking_type_contains,
+    )
+    report["source_snapshot"] = {
+        "done_pickings": len(pickings),
+        "move_lines": len(moves),
+        "source_limit_per_model": source_limit,
+        "truncated_possible": len(pickings) >= source_limit or len(moves) >= source_limit,
+    }
+    return report
+
+
 @app.get("/", tags=["system"])
 def root() -> dict[str, Any]:
     return {
@@ -87,6 +158,7 @@ def root() -> dict[str, Any]:
             "odoo_health": "/health/odoo",
             "inventory_health": "/api/inventory-health",
             "cycle_count_plan": "/api/cycle-count-plan",
+            "kitting_baseline": "/api/kitting-baseline",
             "docs": "/docs",
         },
     }
@@ -126,6 +198,19 @@ def stock_moves(limit: int = Query(default=100, ge=1, le=5000), client: OdooWare
 @app.get("/api/manufacturing-orders", tags=["manufacturing"])
 def manufacturing_orders(limit: int = Query(default=100, ge=1, le=5000), client: OdooWarehouseClient = Depends(get_odoo_client)) -> dict[str, Any]:
     return _fetch_records(client.fetch_manufacturing_orders, limit)
+
+
+@app.get("/api/kitting-baseline", tags=["manufacturing", "analytics"])
+def kitting_baseline(
+    source_limit: int = Query(default=5000, ge=100, le=20000),
+    picking_type_contains: str = Query(default="Pick Components", min_length=0, max_length=100),
+    client: OdooWarehouseClient = Depends(get_odoo_client),
+) -> dict[str, Any]:
+    return _build_kitting_baseline_report(
+        client,
+        source_limit=source_limit,
+        picking_type_contains=picking_type_contains,
+    )
 
 
 @app.get("/api/inventory-health", tags=["module-a"])
