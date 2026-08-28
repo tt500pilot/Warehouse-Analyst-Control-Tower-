@@ -1,21 +1,32 @@
 {
   "read_only_odoo_access_approved": false,
+  "read_only_odoo_access_evidence": "",
   "odoo_write_access_disabled": true,
+  "odoo_write_access_disabled_evidence": "sandbox only; replace with production access-control evidence",
   "approved_odoo_models": [
     "stock.location",
     "stock.quant",
     "stock.move.line"
   ],
+  "approved_odoo_models_evidence": "sandbox example only; replace with approved production data-scope reference",
   "data_classification_review_complete": false,
+  "data_classification_review_evidence": "",
   "approved_measurement_statuses": [
     "FIELD_VERIFIED"
   ],
+  "geometry_verification_evidence": "",
   "capacity_source_approved": false,
+  "capacity_source_evidence": "",
   "product_physical_metadata_source_approved": false,
+  "product_physical_metadata_source_evidence": "",
   "material_handling_method_defined": false,
+  "material_handling_method_reference": "",
   "reservation_control_procedure_defined": false,
+  "reservation_control_procedure_reference": "",
   "traceability_relocation_workflow_defined": false,
+  "traceability_relocation_workflow_reference": "",
   "flight_critical_policy_available": false,
+  "flight_critical_policy_reference": "",
   "human_approval_owner": "",
   "pilot_scope_owner": ""
 }
