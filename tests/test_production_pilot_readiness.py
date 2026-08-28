@@ -88,6 +88,22 @@ def test_geometry_status_requires_external_verification_evidence():
     assert "geometry_field_verified" in result["blocking_check_ids"]
 
 
+def test_placeholder_evidence_reference_is_rejected():
+    config = _ready_config()
+    config["read_only_odoo_access_evidence"] = "sandbox example only; replace with production approval"
+    result = evaluate_production_pilot_readiness(_geometry(), config)
+    assert result["status"] == "BLOCKED"
+    assert "read_only_odoo_access_approved" in result["blocking_check_ids"]
+
+
+def test_todo_evidence_reference_is_rejected():
+    config = _ready_config()
+    config["capacity_source_evidence"] = "TODO capacity approval"
+    result = evaluate_production_pilot_readiness(_geometry(), config)
+    assert result["status"] == "BLOCKED"
+    assert "capacity_source_approved" in result["blocking_check_ids"]
+
+
 def test_readiness_never_authorizes_inventory_execution():
     result = evaluate_production_pilot_readiness(_geometry(), _ready_config())
     assert result["odoo_mutated"] is False
