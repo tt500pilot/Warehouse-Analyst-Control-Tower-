@@ -1,9 +1,8 @@
 """Deterministic read-only slotting optimization for the AWIA sandbox.
 
-The optimizer never mutates Odoo. It takes enriched reservation lines for a
-holdout set of kitting transfers, proposes a candidate product-to-bin mapping,
-and evaluates both current and candidate layouts with the same virtual-picker
-model and assumptions.
+The optimizer never mutates Odoo. It learns a candidate product-to-bin mapping
+from a training set of enriched kitting lines, then evaluates that frozen
+assignment on a separate holdout set with the same virtual-picker model.
 
 The candidate layout changes SKU assignment only. The physical mock-v1 graph,
 aisles, legal paths, and kitting station remain unchanged. Any relocation is a
@@ -196,18 +195,24 @@ def _objective(evaluation: dict[str, Any]) -> tuple[float, float]:
 
 
 def optimize_slotting_layout(
-    reservations_by_picking: dict[int, list[dict[str, Any]]],
+    training_reservations_by_picking: dict[int, list[dict[str, Any]]],
+    holdout_reservations_by_picking: dict[int, list[dict[str, Any]]],
     geometry: Geometry,
     product_metadata: dict[str, dict[str, Any]],
     *,
     assumptions: PickerAssumptions | None = None,
     seed: int = 42,
-    candidate_layout_version: str = "mock-v2-candidate-slotting-v1",
+    candidate_layout_version: str = "mock-v2-candidate-slotting-v2",
 ) -> dict[str, Any]:
-    if not reservations_by_picking:
+    if not training_reservations_by_picking:
+        raise ValueError("At least one training picking is required.")
+    if not holdout_reservations_by_picking:
         raise ValueError("At least one holdout picking is required.")
+    overlap = set(training_reservations_by_picking) & set(holdout_reservations_by_picking)
+    if overlap:
+        raise ValueError(f"Training and holdout picking IDs must be disjoint; overlap={sorted(overlap)}")
 
-    profiles = build_profiles(reservations_by_picking, product_metadata)
+    profiles = build_profiles(training_reservations_by_picking, product_metadata)
     if not profiles:
         raise ValueError("No product codes were available for slotting optimization.")
 
@@ -235,31 +240,28 @@ def optimize_slotting_layout(
         assignment[profile.product_code] = target_tail
         used.add(target_tail)
 
-    baseline = evaluate_layout(
-        reservations_by_picking,
+    training_candidate_rows = _apply_assignment(
+        training_reservations_by_picking,
         geometry,
-        assumptions=assumptions,
-        seed=seed,
+        assignment,
     )
-    candidate_rows = _apply_assignment(reservations_by_picking, geometry, assignment)
-    candidate = evaluate_layout(
-        candidate_rows,
+    training_candidate = evaluate_layout(
+        training_candidate_rows,
         geometry,
         assumptions=assumptions,
         seed=seed,
     )
 
-    # Deterministic pairwise hill-climb. A swap is accepted only when both
-    # products remain eligible and the full holdout virtual-picker objective
-    # improves. This uses the actual route model rather than a distance proxy.
+    # Pairwise hill-climb is TRAINING ONLY. Holdout data is never consulted
+    # during assignment or swap selection.
     improved = True
     passes = 0
     while improved and passes < 20:
         improved = False
         passes += 1
-        current_objective = _objective(candidate)
+        current_objective = _objective(training_candidate)
         best_assignment: dict[str, str] | None = None
-        best_candidate: dict[str, Any] | None = None
+        best_training_candidate: dict[str, Any] | None = None
         best_objective = current_objective
         codes = sorted(assignment)
         for left_index, left_code in enumerate(codes):
@@ -272,7 +274,7 @@ def optimize_slotting_layout(
                     continue
                 trial = dict(assignment)
                 trial[left_code], trial[right_code] = right_tail, left_tail
-                trial_rows = _apply_assignment(reservations_by_picking, geometry, trial)
+                trial_rows = _apply_assignment(training_reservations_by_picking, geometry, trial)
                 trial_evaluation = evaluate_layout(
                     trial_rows,
                     geometry,
@@ -283,14 +285,47 @@ def optimize_slotting_layout(
                 if objective < best_objective:
                     best_objective = objective
                     best_assignment = trial
-                    best_candidate = trial_evaluation
-        if best_assignment is not None and best_candidate is not None:
+                    best_training_candidate = trial_evaluation
+        if best_assignment is not None and best_training_candidate is not None:
             assignment = best_assignment
-            candidate = best_candidate
+            training_candidate = best_training_candidate
             improved = True
 
+    training_baseline = evaluate_layout(
+        training_reservations_by_picking,
+        geometry,
+        assumptions=assumptions,
+        seed=seed,
+    )
+    holdout_baseline = evaluate_layout(
+        holdout_reservations_by_picking,
+        geometry,
+        assumptions=assumptions,
+        seed=seed,
+    )
+    holdout_candidate_rows = _apply_assignment(
+        holdout_reservations_by_picking,
+        geometry,
+        assignment,
+    )
+    holdout_candidate = evaluate_layout(
+        holdout_candidate_rows,
+        geometry,
+        assumptions=assumptions,
+        seed=seed,
+    )
+
+    training_codes = set(profiles)
+    holdout_codes = {
+        str(row.get("product_code") or "")
+        for rows in holdout_reservations_by_picking.values()
+        for row in rows
+        if row.get("product_code")
+    }
+    unseen_holdout_codes = sorted(holdout_codes - training_codes)
+
     current_locations: dict[str, set[str]] = {}
-    for reservations in reservations_by_picking.values():
+    for reservations in training_reservations_by_picking.values():
         for row in reservations:
             code = str(row.get("product_code") or "")
             current_locations.setdefault(code, set()).add(str(row.get("location_tail") or ""))
@@ -307,8 +342,8 @@ def optimize_slotting_layout(
                 "velocity_profile": profile.velocity_profile,
                 "flight_critical": profile.flight_critical,
                 "secure_required": profile.secure_required,
-                "line_frequency": profile.line_frequency,
-                "quantity_demand": profile.quantity_demand,
+                "training_line_frequency": profile.line_frequency,
+                "training_quantity_demand": profile.quantity_demand,
                 "priority_score": round(profile.priority_score, 2),
                 "current_locations": current,
                 "candidate_location": target,
@@ -319,12 +354,14 @@ def optimize_slotting_layout(
             }
         )
 
-    distance_saved = float(baseline["total_distance_ft"]) - float(candidate["total_distance_ft"])
-    minutes_saved = float(baseline["total_start_to_stage_minutes"]) - float(
-        candidate["total_start_to_stage_minutes"]
+    distance_saved = float(holdout_baseline["total_distance_ft"]) - float(
+        holdout_candidate["total_distance_ft"]
     )
-    baseline_distance = float(baseline["total_distance_ft"])
-    baseline_minutes = float(baseline["total_start_to_stage_minutes"])
+    minutes_saved = float(holdout_baseline["total_start_to_stage_minutes"]) - float(
+        holdout_candidate["total_start_to_stage_minutes"]
+    )
+    baseline_distance = float(holdout_baseline["total_distance_ft"])
+    baseline_minutes = float(holdout_baseline["total_start_to_stage_minutes"])
 
     return {
         "mode": "read_only_simulation",
@@ -332,23 +369,39 @@ def optimize_slotting_layout(
         "candidate_layout_version": candidate_layout_version,
         "physical_graph_changed": False,
         "odoo_mutated": False,
+        "experimental_design": {
+            "training_picking_ids": sorted(training_reservations_by_picking),
+            "holdout_picking_ids": sorted(holdout_reservations_by_picking),
+            "training_holdout_overlap": False,
+            "holdout_used_for_optimization": False,
+            "unseen_holdout_product_codes": unseen_holdout_codes,
+            "holdout_product_coverage_pct": round(
+                ((len(holdout_codes) - len(unseen_holdout_codes)) / len(holdout_codes) * 100.0), 2
+            ) if holdout_codes else None,
+        },
         "method": {
-            "initial_assignment": "demand/criticality priority into nearest eligible unique bins",
-            "improvement": "deterministic pairwise swaps scored by full virtual-picker holdout objective",
+            "initial_assignment": "training demand/criticality priority into nearest eligible unique bins",
+            "improvement": "deterministic pairwise swaps scored only on training virtual-picker objective",
             "objective_order": ["total_start_to_stage_minutes", "total_distance_ft"],
             "hill_climb_passes": passes,
         },
-        "baseline": baseline,
-        "candidate": candidate,
-        "improvement": {
-            "distance_saved_ft": round(distance_saved, 3),
-            "distance_reduction_pct": round(distance_saved / baseline_distance * 100.0, 2)
-            if baseline_distance
-            else None,
-            "start_to_stage_minutes_saved": round(minutes_saved, 2),
-            "start_to_stage_reduction_pct": round(minutes_saved / baseline_minutes * 100.0, 2)
-            if baseline_minutes
-            else None,
+        "training": {
+            "baseline": training_baseline,
+            "candidate": training_candidate,
+        },
+        "holdout": {
+            "baseline": holdout_baseline,
+            "candidate": holdout_candidate,
+            "improvement": {
+                "distance_saved_ft": round(distance_saved, 3),
+                "distance_reduction_pct": round(distance_saved / baseline_distance * 100.0, 2)
+                if baseline_distance
+                else None,
+                "start_to_stage_minutes_saved": round(minutes_saved, 2),
+                "start_to_stage_reduction_pct": round(minutes_saved / baseline_minutes * 100.0, 2)
+                if baseline_minutes
+                else None,
+            },
         },
         "recommendations": recommendations,
         "guardrails": {
@@ -356,6 +409,8 @@ def optimize_slotting_layout(
             "secure_products_require_secure_bins": True,
             "unique_candidate_bin_per_product": True,
             "capacity_validation_before_execution": True,
+            "live_occupancy_validation_before_execution": True,
+            "relocation_cost_not_yet_modeled": True,
             "human_approval_before_odoo_move": True,
         },
     }
