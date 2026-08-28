@@ -1,8 +1,8 @@
 """Deterministic human-like picker simulation for AWIA sandbox kitting.
 
-This module does not claim to measure a real person.  It converts the existing
+This module does not claim to measure a real person. It converts the existing
 mock warehouse path graph plus native Odoo reservation lines into a repeatable
-virtual-picker route and time budget.  The output is suitable for synthetic
+virtual-picker route and time budget. The output is suitable for synthetic
 baseline experiments and algorithm comparisons while remaining explicitly
 classified as simulated data.
 """
@@ -72,6 +72,12 @@ def _label(value: Any) -> str | None:
     return None
 
 
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def location_tail(value: str | None) -> str | None:
     match = BIN_TAIL.search(str(value or ""))
     return match.group(1) if match else None
@@ -108,6 +114,35 @@ def load_geometry(data_dir: Path) -> Geometry:
     return Geometry(locations_by_tail=locations, adjacency=adjacency)
 
 
+def load_simulation_product_metadata(data_dir: Path) -> dict[str, dict[str, Any]]:
+    """Load simulation-only product attributes keyed by Odoo default_code.
+
+    The deterministic fixture is authoritative for synthetic attributes that are
+    not guaranteed to exist in vanilla Odoo, especially flight criticality.
+    Transactional identity, quantities, tracking, lots, and source locations
+    still come from live Odoo reservation lines.
+    """
+    products_path = data_dir / "mock_odoo" / "products.csv"
+    if not products_path.exists():
+        raise FileNotFoundError(
+            f"Missing simulation product fixture {products_path}. Run scripts/generate_simulation_sandbox.py first."
+        )
+    result: dict[str, dict[str, Any]] = {}
+    with products_path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            code = str(row.get("default_code") or "").strip()
+            if not code:
+                continue
+            result[code] = {
+                "default_code": code,
+                "x_is_flight_critical": _truthy(row.get("x_is_flight_critical")),
+                "tracking": str(row.get("tracking") or "none"),
+                "category": row.get("category"),
+                "velocity_profile": row.get("velocity_profile"),
+            }
+    return result
+
+
 def shortest_path(
     adjacency: dict[str, list[tuple[str, float]]],
     start: str,
@@ -141,8 +176,11 @@ def enrich_reservation_lines(
     move_lines: list[dict[str, Any]],
     product_by_id: dict[int, dict[str, Any]],
     geometry: Geometry,
+    *,
+    simulation_product_by_code: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    simulation_product_by_code = simulation_product_by_code or {}
     for line in move_lines:
         quantity = _float(line.get("quantity"))
         if quantity <= 0:
@@ -156,14 +194,24 @@ def enrich_reservation_lines(
         if geom is None:
             raise RuntimeError(f"Source location {location_name!r} does not exist in mock-v1 geometry.")
         product = product_by_id.get(product_id, {})
+        product_code = str(product.get("default_code") or "").strip() or None
+        fixture_product = simulation_product_by_code.get(product_code or "", {})
+        if fixture_product:
+            flight_critical = bool(fixture_product.get("x_is_flight_critical", False))
+            criticality_source = "simulation_fixture"
+        else:
+            flight_critical = bool(product.get("x_is_flight_critical", False))
+            criticality_source = "odoo_product"
+
         rows.append(
             {
                 "move_line_id": _int(line.get("id")),
                 "product_id": product_id,
                 "product": _label(line.get("product_id")),
-                "product_code": product.get("default_code") or None,
+                "product_code": product_code,
                 "tracking": str(line.get("tracking") or product.get("tracking") or "none"),
-                "flight_critical": bool(product.get("x_is_flight_critical", False)),
+                "flight_critical": flight_critical,
+                "criticality_source": criticality_source,
                 "quantity": quantity,
                 "lot_id": _int(line.get("lot_id")),
                 "lot": _label(line.get("lot_id")),
@@ -299,6 +347,7 @@ def build_virtual_picker_plan(
         "summary": {
             "pick_lines": len(stops),
             "unique_source_locations": len({row["source_location"] for row in stops}),
+            "flight_critical_lines": sum(1 for row in stops if row.get("flight_critical")),
             "total_distance_ft": round(total_distance, 3),
             "travel_minutes": round(total_travel / 60.0, 2),
             "search_minutes": round(total_search / 60.0, 2),
