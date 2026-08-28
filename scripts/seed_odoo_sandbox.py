@@ -78,6 +78,11 @@ def _search_one(client: OdooWarehouseClient, model: str, domain: list[Any], fiel
     return records[0] if records else None
 
 
+def _print_progress(label: str, current: int, total: int, *, apply: bool) -> None:
+    if apply and (current == 1 or current == total or current % 25 == 0):
+        print(f"{label}: {current}/{total}", flush=True)
+
+
 def _upsert_location(
     client: OdooWarehouseClient,
     *,
@@ -170,6 +175,46 @@ def _upsert_product(client: OdooWarehouseClient, row: dict[str, str], *, apply: 
     return product["id"], "created"
 
 
+def _apply_quant_inventory(
+    client: OdooWarehouseClient,
+    *,
+    product_id: int,
+    location_id: int,
+    target_quantity: float,
+    existing_quant_id: int | None,
+) -> int:
+    """Set on-hand stock using Odoo 19's XML-RPC-safe inverse field.
+
+    ``stock.quant.action_apply_inventory`` returns ``None`` on successful
+    application.  Odoo 19's XML-RPC marshaller rejects ``None``, so calling the
+    action directly produces a false RPC failure.  Writing/creating
+    ``inventory_quantity_auto_apply`` in ``inventory_mode`` invokes the same
+    inventory application internally while the outer public ``write``/``create``
+    method returns an XML-RPC-safe boolean/id.
+    """
+    context = {"inventory_mode": True}
+    if existing_quant_id is not None:
+        client.execute_kw(
+            "stock.quant",
+            "write",
+            args=[[existing_quant_id], {"inventory_quantity_auto_apply": target_quantity}],
+            kwargs={"context": context},
+        )
+        return existing_quant_id
+
+    quant_id = client.execute_kw(
+        "stock.quant",
+        "create",
+        args=[{
+            "product_id": product_id,
+            "location_id": location_id,
+            "inventory_quantity_auto_apply": target_quantity,
+        }],
+        kwargs={"context": context},
+    )
+    return int(quant_id)
+
+
 def seed(*, data_dir: Path = DEFAULT_DATA_DIR, apply: bool = False) -> dict[str, Any]:
     if not (data_dir / "manifest.json").exists():
         generate(data_dir)
@@ -196,46 +241,42 @@ def seed(*, data_dir: Path = DEFAULT_DATA_DIR, apply: bool = False) -> dict[str,
         raise RuntimeError("Unable to resolve AWIA Mock root location.")
 
     location_ids_by_code: dict[str, int] = {}
-    for row in stations:
-        code = f"WH/{row['name']}"
-        barcode = row["station_id"]
+    all_location_rows = [(f"WH/{row['name']}", row["name"], row["station_id"]) for row in stations]
+    all_location_rows += [
+        (row["odoo_complete_name"], row["odoo_complete_name"].split("/")[-1], row["barcode"])
+        for row in locations
+    ]
+    for index, (code, name, barcode) in enumerate(all_location_rows, start=1):
         if apply:
-            location_id, action = _upsert_location(client, parent_id=int(root_id), name=row["name"], barcode=barcode, apply=True)
+            location_id, action = _upsert_location(client, parent_id=int(root_id), name=name, barcode=barcode, apply=True)
             if location_id is not None:
                 location_ids_by_code[code] = location_id
         else:
-            _, action = _upsert_location(client, parent_id=0, name=row["name"], barcode=barcode, apply=False)
+            _, action = _upsert_location(client, parent_id=0, name=name, barcode=barcode, apply=False)
         summary["locations"][action] += 1
-
-    for row in locations:
-        leaf_name = row["odoo_complete_name"].split("/")[-1]
-        if apply:
-            location_id, action = _upsert_location(client, parent_id=int(root_id), name=leaf_name, barcode=row["barcode"], apply=True)
-            if location_id is not None:
-                location_ids_by_code[row["odoo_complete_name"]] = location_id
-        else:
-            _, action = _upsert_location(client, parent_id=0, name=leaf_name, barcode=row["barcode"], apply=False)
-        summary["locations"][action] += 1
+        _print_progress("Locations", index, len(all_location_rows), apply=apply)
 
     product_ids_by_code: dict[str, int] = {}
-    for row in products:
+    for index, row in enumerate(products, start=1):
         product_id, action = _upsert_product(client, row, apply=apply)
         summary["products"][action] += 1
         if product_id is not None:
             product_ids_by_code[row["default_code"]] = product_id
+        _print_progress("Products", index, len(products), apply=apply)
 
     if apply:
         quant_fields = set(client.available_fields("stock.quant"))
-        if "inventory_quantity" not in quant_fields:
+        if "inventory_quantity_auto_apply" not in quant_fields:
             summary["inventory"]["skipped"] = len(quants)
             summary["inventory"]["would_apply"] = 0
-            summary["inventory"]["warning"] = "stock.quant.inventory_quantity is unavailable; inventory seed skipped."
+            summary["inventory"]["warning"] = "stock.quant.inventory_quantity_auto_apply is unavailable; inventory seed skipped."
         else:
-            for row in quants:
+            for index, row in enumerate(quants, start=1):
                 product_id = product_ids_by_code.get(row["product_code"])
                 location_id = location_ids_by_code.get(row["location_code"])
                 if not product_id or not location_id:
                     summary["inventory"]["skipped"] += 1
+                    _print_progress("Inventory", index, len(quants), apply=apply)
                     continue
                 existing = _search_one(
                     client,
@@ -243,19 +284,16 @@ def seed(*, data_dir: Path = DEFAULT_DATA_DIR, apply: bool = False) -> dict[str,
                     [["product_id", "=", product_id], ["location_id", "=", location_id]],
                     ["id"],
                 )
-                target_quantity = float(row["quantity"])
-                if existing:
-                    client.execute_kw("stock.quant", "write", args=[[existing["id"]], {"inventory_quantity": target_quantity}])
-                    quant_ids = [existing["id"]]
-                else:
-                    quant_id = client.execute_kw(
-                        "stock.quant",
-                        "create",
-                        args=[{"product_id": product_id, "location_id": location_id, "inventory_quantity": target_quantity}],
-                    )
-                    quant_ids = [int(quant_id)]
-                client.execute_kw("stock.quant", "action_apply_inventory", args=[quant_ids])
+                existing_id = int(existing["id"]) if existing else None
+                _apply_quant_inventory(
+                    client,
+                    product_id=product_id,
+                    location_id=location_id,
+                    target_quantity=float(row["quantity"]),
+                    existing_quant_id=existing_id,
+                )
                 summary["inventory"]["applied"] += 1
+                _print_progress("Inventory", index, len(quants), apply=apply)
             summary["inventory"]["would_apply"] = 0
 
     summary["root_location"] = root_action
