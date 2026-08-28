@@ -31,6 +31,11 @@ def main() -> None:
     parser.add_argument("--lookback-days", type=int, default=90)
     parser.add_argument("--source-limit", type=int, default=20000)
     parser.add_argument("--top", type=int, default=20)
+    parser.add_argument(
+        "--output",
+        default="",
+        help="Optional path to save the full JSON result before top-N display truncation.",
+    )
     args = parser.parse_args()
     if args.lookback_days <= 0:
         raise ValueError("--lookback-days must be greater than zero")
@@ -132,9 +137,17 @@ def main() -> None:
             len(rows) >= args.source_limit for rows in (products, quants, moves, bom_lines)
         ),
     }
-    result["recommendations"] = result["recommendations"][: args.top]
-    result["returned_recommendations"] = len(result["recommendations"])
-    print(json.dumps(result, indent=2))
+
+    if args.output.strip():
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        result["saved_output"] = str(output)
+
+    display_result = dict(result)
+    display_result["recommendations"] = result["recommendations"][: args.top]
+    display_result["returned_recommendations"] = len(display_result["recommendations"])
+    print(json.dumps(display_result, indent=2))
 
 
 if __name__ == "__main__":
