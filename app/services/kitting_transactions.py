@@ -12,9 +12,16 @@ from typing import Any
 
 
 def _m2o_id(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
     if isinstance(value, int):
         return value
-    if isinstance(value, (list, tuple)) and value and isinstance(value[0], int):
+    if (
+        isinstance(value, (list, tuple))
+        and value
+        and isinstance(value[0], int)
+        and not isinstance(value[0], bool)
+    ):
         return value[0]
     return None
 
@@ -30,10 +37,16 @@ def _m2o_label(value: Any) -> str | None:
 def _ids(value: Any) -> list[int]:
     if not isinstance(value, (list, tuple)):
         return []
-    return [item for item in value if isinstance(item, int)]
+    return [
+        item
+        for item in value
+        if isinstance(item, int) and not isinstance(item, bool)
+    ]
 
 
 def _number(value: Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
     if isinstance(value, (int, float)):
         return float(value)
     return 0.0
@@ -74,7 +87,9 @@ def inspect_kitting_transactions(
         pbm_pickings = list(pickings)
 
     picking_by_id = {
-        row["id"]: row for row in pbm_pickings if isinstance(row.get("id"), int)
+        row["id"]: row
+        for row in pbm_pickings
+        if isinstance(row.get("id"), int) and not isinstance(row.get("id"), bool)
     }
     picking_by_origin: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in pbm_pickings:
@@ -126,8 +141,8 @@ def inspect_kitting_transactions(
 
         picking_rows: list[dict[str, Any]] = []
         for picking in linked:
-            picking_id = picking.get("id")
-            if not isinstance(picking_id, int):
+            picking_id = _m2o_id(picking.get("id"))
+            if picking_id is None:
                 continue
             linked_picking_ids.add(picking_id)
             picking_state = str(picking.get("state") or "unknown")
@@ -136,8 +151,8 @@ def inspect_kitting_transactions(
             component_rows: list[dict[str, Any]] = []
             transfer_ready = picking_state == "assigned"
             for move in sorted(moves_by_picking.get(picking_id, []), key=lambda row: int(row.get("id") or 0)):
-                move_id = move.get("id")
-                reserved_lines = lines_by_move.get(move_id, []) if isinstance(move_id, int) else []
+                move_id = _m2o_id(move.get("id"))
+                reserved_lines = lines_by_move.get(move_id, []) if move_id is not None else []
                 source_locations = sorted(
                     {
                         label
