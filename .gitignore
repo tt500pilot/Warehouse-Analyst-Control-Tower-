@@ -18,6 +18,9 @@ venv/
 data/simulation_sandbox/*
 !data/simulation_sandbox/README.md
 
+# Local runtime state
+data/runtime/
+
 # Editors / OS
 .vscode/
 .idea/
