@@ -9,6 +9,7 @@ AWIA is a warehouse analytics and decision-support application that connects to 
 - Streamlit Control Tower UI that consumes the FastAPI service.
 - Read endpoints for products, inventory quants, stock move lines, and manufacturing orders.
 - Module A inventory-health scoring and advisory cycle-count planning.
+- Deterministic AWIA Simulation Sandbox with linked mock Odoo transactions and warehouse geometry.
 
 ### Module A first slice
 
@@ -42,13 +43,41 @@ $env:ODOO_PASSWORD="admin"
 $env:ODOO_ALLOW_INSECURE_HTTP="true"
 ```
 
+## AWIA Simulation Sandbox
+
+Generate the deterministic mock warehouse + mock Odoo fixture set:
+
+```powershell
+python .\scripts\generate_simulation_sandbox.py
+```
+
+This creates `data\simulation_sandbox\` with:
+
+- a fixed warehouse datum and layout version
+- 192 physical bins with X/Y/Z coordinates
+- a connected aisle/cross-aisle travel graph
+- 80 synthetic products
+- 120 manufacturing orders and Pick Components transfers
+- 2,500+ stock move lines
+- deliberately embedded benchmark problems for slotting, co-pick, shortage, and cycle-count testing
+
+The full specification is in `docs/architecture/simulation-sandbox.md`.
+
+Generated CSV/JSON files are intentionally not committed; they are reproducible from seed `42`.
+
 ## Run tests
 
 ```powershell
 python -m pytest -q
 ```
 
-Current expected result: 15 passing tests.
+Current expected result: 19 passing tests.
+
+To validate only the sandbox:
+
+```powershell
+python -m pytest -q .\tests\test_simulation_sandbox.py
+```
 
 ## Start FastAPI - Terminal 1
 
