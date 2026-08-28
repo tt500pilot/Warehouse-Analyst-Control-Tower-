@@ -277,12 +277,24 @@ def inspect_kitting_transactions(
     waiting_transfers = sum(
         picking_states.get(state, 0) for state in ("waiting", "confirmed")
     )
+    completed_transfers = picking_states.get("done", 0)
+    cancelled_transfers = picking_states.get("cancel", 0)
+    open_transfers = max(
+        0,
+        len(linked_picking_ids) - completed_transfers - cancelled_transfers,
+    )
+    all_open_transfers_execution_ready = (
+        open_transfers == 0 or execution_ready_transfers == open_transfers
+    )
 
     return {
         "summary": {
             "manufacturing_orders": len(transactions),
             "manufacturing_orders_with_pick_components": linked_mos,
             "pick_component_transfers": len(linked_picking_ids),
+            "open_transfers": open_transfers,
+            "completed_transfers": completed_transfers,
+            "cancelled_transfers": cancelled_transfers,
             "component_moves": total_component_moves,
             "reservation_move_lines": total_move_lines,
             "ready_transfers": ready_transfers,
@@ -294,6 +306,7 @@ def inspect_kitting_transactions(
             "tracking_missing_lines": tracking_missing_lines,
             "reservation_incomplete_moves": reservation_incomplete_moves,
             "execution_ready_transfers": execution_ready_transfers,
+            "all_open_transfers_execution_ready": all_open_transfers_execution_ready,
             "all_transfers_execution_ready": bool(linked_picking_ids) and execution_ready_transfers == len(linked_picking_ids),
             "all_manufacturing_orders_linked": bool(transactions) and linked_mos == len(transactions),
             "mo_states": dict(sorted(mo_states.items())),
@@ -303,7 +316,7 @@ def inspect_kitting_transactions(
             "linkage": "Prefer native mrp.production.picking_ids; fall back to stock.picking.origin matching the MO reference.",
             "reservation_quantity": "reserved_line_quantity is the sum of native stock.move.line.quantity on the open transfer. It is reservation/operation evidence, not completed picked quantity unless the move is actually picked/done.",
             "tracking": "A lot/serial-tracked reservation line with positive quantity is execution-ready only when native lot_id or lot_name is present.",
-            "execution_readiness": "A transfer is execution-ready only when it is assigned, every component demand is fully reserved, and every tracked reservation line has lot/serial evidence.",
+            "execution_readiness": "A transfer is execution-ready only when it is assigned, every component demand is fully reserved, and every tracked reservation line has lot/serial evidence. all_open_transfers_execution_ready excludes transfers already done or cancelled.",
             "timing": "Open transfers are inspection data only. Cycle-time KPIs remain restricted to completed pickings in /api/kitting-baseline.",
             "mutations": "This inspector is read-only and never validates, picks, or completes Odoo transfers.",
         },
