@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from app.services.forward_pick_optimizer import optimize_forward_pick_layout
 from app.services.slotting_optimizer import load_slotting_product_metadata
@@ -56,13 +61,13 @@ def main() -> None:
         pick_face_qty = float(row["pick_face_quantity"])
         avg_demand = float(row.get("average_training_demand_per_kit") or 0.0)
 
-        total_live = 0.0
-        total_reserved = 0.0
         source_tail = None
         for current in row.get("current_locations", []):
             source_tail = source_tail or current
-        # The optimizer's quantity_to_move_now can exceed total live stock when
-        # the desired face quantity is larger than what physically exists.
+
+        # If a face remains at the SKU's current bin and the desired face quantity
+        # exceeds what can actually be staged from available stock, classify the
+        # gap as a supply shortfall rather than a relocation requirement.
         if row.get("assignment_reason") in {"keep_exclusive_current", "reverted_low_value_move"}:
             moved = float(row.get("unreserved_move_quantity_planned") or 0.0)
             gap = float(row.get("reservation_quantity_gap") or 0.0)
@@ -72,19 +77,43 @@ def main() -> None:
         for leg in row.get("move_legs", []):
             distance = float(leg.get("graph_distance_ft") or 0.0)
             qty = float(leg.get("quantity") or 0.0)
-            service_seconds = assumptions.base_search_seconds + assumptions.base_handling_seconds + assumptions.base_scan_seconds * 2.0 + assumptions.handling_seconds_per_unit * min(qty, 10.0)
-            setup_minutes += (distance / assumptions.walking_speed_ft_s + service_seconds) / 60.0
+            service_seconds = (
+                assumptions.base_search_seconds
+                + assumptions.base_handling_seconds
+                + assumptions.base_scan_seconds * 2.0
+                + assumptions.handling_seconds_per_unit * min(qty, 10.0)
+            )
+            setup_minutes += (
+                distance / assumptions.walking_speed_ft_s + service_seconds
+            ) / 60.0
 
         if source_tail and source_tail != target and avg_demand > 0 and pick_face_qty > 0:
             direct = _tail_distance(geometry, source_tail, target)
             source_node = geometry.locations_by_tail[source_tail]["graph_node_id"]
             target_node = geometry.locations_by_tail[target]["graph_node_id"]
-            to_source = float(shortest_path(geometry.adjacency, geometry.kitting_node, source_node)[0])
-            to_kitting = float(shortest_path(geometry.adjacency, target_node, geometry.kitting_node)[0])
-            service_seconds = assumptions.base_search_seconds + assumptions.base_handling_seconds + assumptions.base_scan_seconds * 2.0 + assumptions.handling_seconds_per_unit * min(pick_face_qty, 10.0)
+            to_source = float(
+                shortest_path(geometry.adjacency, geometry.kitting_node, source_node)[0]
+            )
+            to_kitting = float(
+                shortest_path(geometry.adjacency, target_node, geometry.kitting_node)[0]
+            )
+            service_seconds = (
+                assumptions.base_search_seconds
+                + assumptions.base_handling_seconds
+                + assumptions.base_scan_seconds * 2.0
+                + assumptions.handling_seconds_per_unit * min(pick_face_qty, 10.0)
+            )
             events_per_kit = avg_demand / pick_face_qty
-            replenishment_lower += ((direct / assumptions.walking_speed_ft_s + service_seconds) / 60.0) * events_per_kit
-            replenishment_upper += (((to_source + direct + to_kitting) / assumptions.walking_speed_ft_s + service_seconds) / 60.0) * events_per_kit
+            replenishment_lower += (
+                (direct / assumptions.walking_speed_ft_s + service_seconds) / 60.0
+            ) * events_per_kit
+            replenishment_upper += (
+                (
+                    (to_source + direct + to_kitting) / assumptions.walking_speed_ft_s
+                    + service_seconds
+                )
+                / 60.0
+            ) * events_per_kit
 
     optimistic_net = gross_saved_per_kit - replenishment_lower
     pessimistic_net = gross_saved_per_kit - replenishment_upper
@@ -96,8 +125,12 @@ def main() -> None:
         "replenishment_minutes_per_kit_upper_bound": round(replenishment_upper, 4),
         "optimistic_net_minutes_saved_per_kit": round(optimistic_net, 4),
         "pessimistic_net_minutes_saved_per_kit": round(pessimistic_net, 4),
-        "optimistic_payback_kits": round(setup_minutes / optimistic_net, 1) if optimistic_net > 0 else None,
-        "pessimistic_payback_kits": round(setup_minutes / pessimistic_net, 1) if pessimistic_net > 0 else None,
+        "optimistic_payback_kits": (
+            round(setup_minutes / optimistic_net, 1) if optimistic_net > 0 else None
+        ),
+        "pessimistic_payback_kits": (
+            round(setup_minutes / pessimistic_net, 1) if pessimistic_net > 0 else None
+        ),
         "supply_shortfalls_not_relocation_gaps": supply_shortfalls,
         "capacity_fixture_recalibration_required": True,
         "odoo_writes": False,
