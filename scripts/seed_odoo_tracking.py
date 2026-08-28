@@ -7,7 +7,7 @@ AWIA Pick Components transfers.
 
 Why demand-scoped instead of serializing the whole sandbox?
 A full conversion would create thousands of serial records that are irrelevant
-to the current 12-kit workflow.  This script instead moves just the required
+to the current 12-kit workflow. This script instead moves just the required
 quantity from anonymous tracked stock into deterministic lot/serial quants,
 lets Odoo rebuild the reservations, and restores the remaining anonymous stock.
 Total on-hand quantity is preserved.
@@ -40,9 +40,8 @@ import math
 import re
 import sys
 from collections import defaultdict
-from typing import Any
-
 from pathlib import Path
+from typing import Any
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -101,17 +100,12 @@ def _serial_name(product_code: str, location_id: int, sequence: int) -> str:
     return f"{LOT_PREFIX}-{_safe_token(product_code)}-{location_id}-S{sequence:04d}"
 
 
-def build_tracking_targets(
-    demands: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+def build_tracking_targets(demands: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Expand product/location demand into deterministic lot/serial target rows."""
     targets: list[dict[str, Any]] = []
     ordered = sorted(
         demands,
-        key=lambda row: (
-            str(row["product_code"]),
-            int(row["location_id"]),
-        ),
+        key=lambda row: (str(row["product_code"]), int(row["location_id"])),
     )
     for row in ordered:
         code = str(row["product_code"])
@@ -149,6 +143,30 @@ def build_tracking_targets(
                 }
             )
     return targets
+
+
+def merge_product_tracking(
+    products: list[dict[str, Any]],
+    moves: list[dict[str, Any]],
+) -> dict[int, dict[str, Any]]:
+    """Prefer stock.move.has_tracking, the same signal used by readiness checks."""
+    tracking_by_product: dict[int, str] = {}
+    for move in moves:
+        product_id = _m2o_id(move.get("product_id"))
+        tracking = str(move.get("has_tracking") or "none")
+        if product_id is not None and tracking in {"lot", "serial"}:
+            tracking_by_product[product_id] = tracking
+
+    result: dict[int, dict[str, Any]] = {}
+    for product in products:
+        product_id = product.get("id")
+        if not isinstance(product_id, int):
+            continue
+        enriched = dict(product)
+        if product_id in tracking_by_product:
+            enriched["tracking"] = tracking_by_product[product_id]
+        result[product_id] = enriched
+    return result
 
 
 def _search_one(
@@ -231,18 +249,15 @@ def _resolve_awia_kitting_scope(
             if product_id is not None
         }
     )
+    product_fields = [field for field in ("id", "default_code", "tracking") if field in set(client.available_fields("product.product"))]
     products = client.search_read(
         "product.product",
         domain=[["id", "in", product_ids]],
-        fields=["id", "default_code", "tracking"],
+        fields=product_fields,
         limit=5000,
         order="id asc",
     )
-    product_by_id = {
-        int(row["id"]): row
-        for row in products
-        if isinstance(row.get("id"), int)
-    }
+    product_by_id = merge_product_tracking(products, moves)
 
     line_fields = [
         "id",
@@ -284,6 +299,7 @@ def _resolve_awia_kitting_scope(
         "product_by_id": product_by_id,
         "reservation_lines": reservation_lines,
         "missing_tracking_lines": missing_lines,
+        "tracking_source": "stock.move.has_tracking",
     }
 
 
@@ -479,6 +495,7 @@ def migrate_tracking(
     summary: dict[str, Any] = {
         "database": client.database,
         "mode": "apply" if apply else "dry_run",
+        "tracking_source": scope["tracking_source"],
         "awia_pick_component_transfers": len(scope["pickings"]),
         "reservation_lines_total": len(scope["reservation_lines"]),
         "missing_tracking_lines_to_rebuild": len(scope["missing_tracking_lines"]),
@@ -521,10 +538,6 @@ def migrate_tracking(
         )
         summary["anonymous_quants"][action] += 1
         _print_progress("Anonymous inventory isolated", index, len(pair_snapshots))
-
-    targets_by_pair: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
-    for target in targets:
-        targets_by_pair[(int(target["product_id"]), int(target["location_id"]))].append(target)
 
     for index, target in enumerate(targets, start=1):
         lot_id, lot_action = _ensure_lot(
