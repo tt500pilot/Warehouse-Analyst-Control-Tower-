@@ -21,6 +21,7 @@ from math import ceil
 from typing import Any, Iterable, Mapping
 
 Record = Mapping[str, Any]
+GENERIC_STOCK_CONTAINERS = {"awia mock", "mock", "bins"}
 
 
 def _number(value: Any) -> float:
@@ -89,14 +90,34 @@ def _location_name(row: Record) -> str:
     return ""
 
 
+def _path_parts(location_name: str) -> list[str]:
+    return [part.strip() for part in str(location_name).split("/") if part.strip()]
+
+
+def _is_candidate_storage_location(location: Record) -> bool:
+    """Return True only for internal descendants of an Odoo Stock location.
+
+    Operational locations such as Pre-Production, Production, staging, and
+    virtual Inventory Adjustment can have quants/reservations but are flow
+    endpoints, not storage areas to rank for physical bin mapping.
+    """
+    usage = str(location.get("usage") or "internal").lower()
+    if usage != "internal":
+        return False
+    parts = _path_parts(_location_name(location))
+    return any(part.lower() == "stock" for part in parts)
+
+
 def derive_logical_area(location_name: str) -> tuple[str, str]:
     """Derive a stable pre-geometry mapping area from an Odoo location name.
 
-    Preferred strategy is the first hierarchy segment below ``Stock``. If Odoo
-    has a flat ``WH/Stock/A-01`` style layout, an aisle-like alpha prefix is used
-    as a fallback. This is a logical grouping only; it is not physical geometry.
+    Preferred strategy is a meaningful hierarchy segment below ``Stock``. For a
+    flat ``WH/Stock/A-01`` layout, an aisle-like alpha prefix is used. The AWIA
+    sandbox has a neutral ``AWIA Mock`` container below Stock, so the aisle is
+    derived one level deeper rather than collapsing every bin into one area.
+    This remains logical grouping only; it is not physical geometry.
     """
-    parts = [part.strip() for part in str(location_name).split("/") if part.strip()]
+    parts = _path_parts(location_name)
     if not parts:
         return "UNMAPPED", "unmapped"
 
@@ -106,16 +127,30 @@ def derive_logical_area(location_name: str) -> tuple[str, str]:
     )
     if stock_index is not None:
         suffix = parts[stock_index + 1 :]
-        base = "/".join(parts[: stock_index + 1])
-        if len(suffix) >= 2:
-            return f"{base}/{suffix[0]}", "hierarchy_below_stock"
-        if len(suffix) == 1:
-            token = suffix[0]
+        base_parts = parts[: stock_index + 1]
+        if not suffix:
+            return "/".join(base_parts), "stock_parent_only"
+
+        first = suffix[0]
+        if first.lower() in GENERIC_STOCK_CONTAINERS and len(suffix) >= 2:
+            base_parts.append(first)
+            token = suffix[1]
             match = re.match(r"^([A-Za-z]+)[-_ ]?\d", token)
             if match:
-                return f"{base}/Aisle {match.group(1).upper()}", "flat_aisle_prefix"
-            return f"{base}/{token}", "single_child_below_stock"
-        return base, "stock_parent_only"
+                return (
+                    f"{'/'.join(base_parts)}/Aisle {match.group(1).upper()}",
+                    "nested_flat_aisle_prefix",
+                )
+            return f"{'/'.join(base_parts)}/{token}", "nested_child_below_stock"
+
+        base = "/".join(base_parts)
+        if len(suffix) >= 2:
+            return f"{base}/{first}", "hierarchy_below_stock"
+
+        match = re.match(r"^([A-Za-z]+)[-_ ]?\d", first)
+        if match:
+            return f"{base}/Aisle {match.group(1).upper()}", "flat_aisle_prefix"
+        return f"{base}/{first}", "single_child_below_stock"
 
     if len(parts) >= 2:
         return "/".join(parts[:-1]), "parent_path_fallback"
@@ -201,28 +236,31 @@ def analyze_mapping_priorities(
         if location_id is not None:
             location_by_id[location_id] = location
 
-    # Positive/current stock defines the candidate storage footprint. This keeps
-    # receiving, production, staging, and other stations from becoming mapping
-    # candidates merely because they appear in move history.
+    # Candidate mapping storage must be a real internal location beneath Stock.
+    # Quants in Pre-Production/Production/staging or virtual adjustment locations
+    # remain useful as flow counterparts but cannot become ranked storage areas.
+    eligible_storage_location_ids = {
+        location_id
+        for location_id, location in location_by_id.items()
+        if _is_candidate_storage_location(location)
+    }
     storage_location_ids: set[int] = set()
+    excluded_quant_location_ids: set[int] = set()
     for quant in quants_list:
         location_id = _m2o_id(quant.get("location_id"))
-        if location_id is not None and _number(quant.get("quantity")) != 0:
+        if location_id is None or _number(quant.get("quantity")) == 0:
+            continue
+        if location_id in eligible_storage_location_ids:
             storage_location_ids.add(location_id)
+        else:
+            excluded_quant_location_ids.add(location_id)
 
     area_by_location: dict[int, str] = {}
     grouping_strategy_by_area: dict[str, set[str]] = defaultdict(set)
     location_name_by_id: dict[int, str] = {}
     for location_id in storage_location_ids:
-        location = location_by_id.get(location_id, {})
-        name = _location_name(location) or next(
-            (
-                _m2o_name(quant.get("location_id"))
-                for quant in quants_list
-                if _m2o_id(quant.get("location_id")) == location_id
-            ),
-            str(location_id),
-        )
+        location = location_by_id[location_id]
+        name = _location_name(location)
         location_name_by_id[location_id] = name
         area, strategy = derive_logical_area(name)
         area_by_location[location_id] = area
@@ -448,7 +486,7 @@ def analyze_mapping_priorities(
         "lookback_days": lookback_days,
         "methodology": {
             "purpose": "rank where physical warehouse mapping is most likely to be useful before XYZ/path data exists",
-            "area_grouping": "prefer first Odoo hierarchy segment below Stock; fall back to aisle-like bin prefixes or parent paths",
+            "area_grouping": "rank only internal Stock descendants; prefer meaningful hierarchy below Stock and fall back to aisle-like prefixes",
             "velocity": "relative stock-move touch rank among active products; top 20% HIGH, next 30% MEDIUM, remainder LOW",
             "score": "relative 0-100 opportunity index across areas, not a savings estimate",
             "weights": weights,
@@ -464,6 +502,7 @@ def analyze_mapping_priorities(
         "summary": {
             "logical_areas_ranked": len(ranked),
             "storage_locations_seen": len(storage_location_ids),
+            "quant_locations_excluded_from_storage_ranking": len(excluded_quant_location_ids),
             "products_seen": len(products_by_id),
             "move_lines_seen": len(moves_list),
             "bom_lines_seen": len(bom_lines_list),
