@@ -10,6 +10,17 @@ REQUIRED_READ_MODELS = {
     "stock.move.line",
 }
 
+PLACEHOLDER_EVIDENCE_MARKERS = (
+    "sandbox",
+    "example",
+    "replace with",
+    "placeholder",
+    "todo",
+    "tbd",
+    "dummy",
+    "test only",
+)
+
 
 def _bool(config: Record, key: str) -> bool:
     return bool(config.get(key))
@@ -19,8 +30,16 @@ def _text(config: Record, key: str) -> str:
     return str(config.get(key) or "").strip()
 
 
+def _is_valid_evidence_reference(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    normalized = text.lower()
+    return not any(marker in normalized for marker in PLACEHOLDER_EVIDENCE_MARKERS)
+
+
 def _declared_with_evidence(config: Record, flag_key: str, evidence_key: str) -> bool:
-    return _bool(config, flag_key) and bool(_text(config, evidence_key))
+    return _bool(config, flag_key) and _is_valid_evidence_reference(_text(config, evidence_key))
 
 
 def _measurement_statuses(geometry: Record) -> list[str]:
@@ -40,7 +59,7 @@ def evaluate_production_pilot_readiness(
 
     This gate never authorizes inventory movement or Odoo writes. A READY result means
     only that prerequisite controls for a read-only pilot have been explicitly declared,
-    evidence references are present, and geometry provenance is approved.
+    non-placeholder evidence references are present, and geometry provenance is approved.
     """
 
     approved_models = {str(value) for value in config.get("approved_odoo_models") or []}
@@ -69,7 +88,7 @@ def evaluate_production_pilot_readiness(
         _declared_with_evidence(
             config, "read_only_odoo_access_approved", "read_only_odoo_access_evidence"
         ),
-        "Approved read-only access to the production Odoo subset must be documented with an evidence reference.",
+        "Approved read-only access to the production Odoo subset must be documented with a non-placeholder evidence reference.",
         read_access_evidence,
     )
 
@@ -79,23 +98,23 @@ def evaluate_production_pilot_readiness(
         _declared_with_evidence(
             config, "odoo_write_access_disabled", "odoo_write_access_disabled_evidence"
         ),
-        "The pilot identity must not possess warehouse write permissions, and the access-control evidence must be referenced.",
+        "The pilot identity must not possess warehouse write permissions, and a non-placeholder access-control evidence reference must be recorded.",
         write_disabled_evidence,
     )
 
     missing_models = sorted(REQUIRED_READ_MODELS - approved_models)
     models_evidence = _text(config, "approved_odoo_models_evidence")
-    models_pass = not missing_models and bool(models_evidence)
+    models_pass = not missing_models and _is_valid_evidence_reference(models_evidence)
     add(
         "required_odoo_models_approved",
         models_pass,
         (
-            "Approved read models include the minimum warehouse evidence set and approval evidence is referenced."
+            "Approved read models include the minimum warehouse evidence set and a non-placeholder approval reference is recorded."
             if models_pass
             else (
                 f"Missing approved models: {', '.join(missing_models)}"
                 if missing_models
-                else "Approved Odoo model list has no approval evidence reference."
+                else "Approved Odoo model list has no valid production approval evidence reference."
             )
         ),
         models_evidence,
@@ -109,21 +128,23 @@ def evaluate_production_pilot_readiness(
             "data_classification_review_complete",
             "data_classification_review_evidence",
         ),
-        "Data classification / export-control / confidentiality review must be complete and its approval reference recorded.",
+        "Data classification / export-control / confidentiality review must be complete and a non-placeholder approval reference recorded.",
         classification_evidence,
     )
 
     unapproved_statuses = sorted(set(geometry_statuses) - approved_statuses)
     geometry_evidence = _text(config, "geometry_verification_evidence")
     geometry_provenance_pass = bool(geometry_statuses) and not unapproved_statuses
-    geometry_pass = geometry_provenance_pass and bool(geometry_evidence)
+    geometry_pass = geometry_provenance_pass and _is_valid_evidence_reference(
+        geometry_evidence
+    )
     if not geometry_statuses:
         geometry_detail = "Geometry artifact does not declare measurement provenance."
     elif unapproved_statuses:
         geometry_detail = f"Unapproved geometry measurement statuses: {', '.join(unapproved_statuses)}"
-    elif not geometry_evidence:
+    elif not _is_valid_evidence_reference(geometry_evidence):
         geometry_detail = (
-            f"Geometry statuses are approved ({', '.join(geometry_statuses)}), but no field-verification evidence reference is recorded."
+            f"Geometry statuses are approved ({', '.join(geometry_statuses)}), but no valid production field-verification evidence reference is recorded."
         )
     else:
         geometry_detail = f"Geometry measurement statuses approved: {', '.join(geometry_statuses)}"
@@ -139,13 +160,13 @@ def evaluate_production_pilot_readiness(
             "capacity_source_approved",
             "capacity_source_approved",
             "capacity_source_evidence",
-            "Bin/unit/weight capacities must come from an approved field-verified or controlled engineering source with evidence reference.",
+            "Bin/unit/weight capacities must come from an approved field-verified or controlled engineering source with a non-placeholder evidence reference.",
         ),
         (
             "product_physical_metadata_source_approved",
             "product_physical_metadata_source_approved",
             "product_physical_metadata_source_evidence",
-            "Weight/dimension metadata used for feasibility must come from an approved source with evidence reference.",
+            "Weight/dimension metadata used for feasibility must come from an approved source with a non-placeholder evidence reference.",
         ),
         (
             "material_handling_method_defined",
@@ -221,6 +242,7 @@ def evaluate_production_pilot_readiness(
             "READY_FOR_READ_ONLY_PRODUCTION_PILOT does not authorize inventory movement, Odoo writes, purchasing, scrapping, or vendor communication.",
             "MOCK_FIXTURE or other unapproved measurement provenance must block production-pilot readiness.",
             "Boolean declarations without evidence references are insufficient for evidence-backed production controls.",
+            "Sandbox/example/TODO/TBD/placeholder evidence references are invalid for production readiness.",
             "Evidence references are audit pointers, not independent proof; they must correspond to real organizational approvals outside the software.",
             "The production pilot should use a least-privilege read-only identity and an explicitly approved data subset.",
         ],
