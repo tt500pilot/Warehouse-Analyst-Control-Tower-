@@ -199,7 +199,7 @@ def main() -> None:
             if not row.get("capacity_screen_pass")
         ],
         "guardrails": [
-            "No calendar-time or annual ROI is calculated from the six-picking synthetic sample.",
+            f"No calendar-time or annual ROI is calculated from the {completed_pickings}-picking completed modeled sample.",
             "Walking-only savings exclude search, handling, scanning, congestion, equipment, and whole-kit route effects.",
             "Setup time is intentionally a sensitivity input because the material-handling method is not defined.",
             "A tracked product with anonymous stock must clear traceability before any relocation pilot is considered.",
