@@ -202,11 +202,7 @@ class KittingEventStore:
         route_algorithm_version: str | None = None,
         notes: str | None = None,
     ) -> dict[str, Any]:
-        """Correct non-transactional session labels without altering event history.
-
-        Intended for metadata such as simulator/operator/version tags.  Timestamps,
-        status, picking identity, and event rows are deliberately immutable here.
-        """
+        """Correct non-transactional session labels without altering event history."""
         session = self.get_session(session_id)
         if session["status"] in {"closed", "cancelled"}:
             raise SessionStateError(
@@ -228,6 +224,81 @@ class KittingEventStore:
                 [*updates.values(), session_id],
             )
         return self.get_session(session_id)
+
+    def repair_simulated_session(self, session_id: str) -> dict[str, Any]:
+        """Repair session header metadata from immutable simulated event evidence.
+
+        This is intentionally narrow: it only derives the route algorithm from a
+        single simulator_version present in event metadata and, for a closed
+        session, ensures closed_at is not earlier than the stage_complete event.
+        Event rows, picking identity, quantities, and Odoo data are never changed.
+        """
+        session = self.get_session(session_id)
+        if session["status"] not in {"staged", "closed"}:
+            raise SessionStateError(
+                f"Session {session_id} is {session['status']!r}; simulated repair requires staged/closed."
+            )
+        events = self.events_for_session(session_id)
+        stage_events = [event for event in events if event["event_type"] == "stage_complete"]
+        if len(stage_events) != 1:
+            raise SessionStateError(
+                f"Simulated repair requires exactly one stage_complete event; found {len(stage_events)}."
+            )
+        simulator_versions = sorted(
+            {
+                str(event.get("metadata", {}).get("simulator_version"))
+                for event in events
+                if event.get("metadata", {}).get("simulator_version")
+            }
+        )
+        if len(simulator_versions) != 1:
+            raise SessionStateError(
+                f"Simulated repair requires exactly one simulator_version; found {simulator_versions}."
+            )
+
+        stage_at = _parse(str(stage_events[0]["occurred_at"]))
+        if stage_at is None:
+            raise SessionStateError("stage_complete event has no valid occurred_at timestamp.")
+        simulator_version = simulator_versions[0]
+        repairs: dict[str, dict[str, Any]] = {}
+        updates: dict[str, Any] = {}
+
+        if session.get("route_algorithm_version") != simulator_version:
+            repairs["route_algorithm_version"] = {
+                "from": session.get("route_algorithm_version"),
+                "to": simulator_version,
+            }
+            updates["route_algorithm_version"] = simulator_version
+
+        if session["status"] == "closed":
+            closed_at = _parse(session.get("closed_at"))
+            if closed_at is None or closed_at < stage_at:
+                repaired_close = _iso(stage_at)
+                repairs["closed_at"] = {
+                    "from": session.get("closed_at"),
+                    "to": repaired_close,
+                }
+                updates["closed_at"] = repaired_close
+
+        if updates:
+            assignments = ", ".join(f"{key} = ?" for key in updates)
+            with self._connect() as connection:
+                connection.execute(
+                    f"UPDATE kitting_sessions SET {assignments} WHERE session_id = ?",
+                    [*updates.values(), session_id],
+                )
+
+        return {
+            "session": self.get_session(session_id),
+            "repairs": repairs,
+            "event_history_changed": False,
+            "evidence": {
+                "stage_complete_event_id": stage_events[0]["event_id"],
+                "stage_complete_at": _iso(stage_at),
+                "simulator_version": simulator_version,
+                "event_count": len(events),
+            },
+        }
 
     def append_event(
         self,
@@ -307,7 +378,17 @@ class KittingEventStore:
             raise SessionStateError(
                 "A normal session can only close after stage_complete has been recorded."
             )
-        timestamp = _iso(occurred_at or self._now())
+        close_time = occurred_at or self._now()
+        if not cancelled:
+            stage_time = _parse(session.get("stage_completed_at"))
+            if stage_time is not None:
+                normalized_close = close_time
+                if normalized_close.tzinfo is None:
+                    normalized_close = normalized_close.replace(tzinfo=timezone.utc)
+                normalized_close = normalized_close.astimezone(timezone.utc)
+                if normalized_close < stage_time:
+                    close_time = stage_time
+        timestamp = _iso(close_time)
         status = "cancelled" if cancelled else "closed"
         with self._connect() as connection:
             connection.execute(
