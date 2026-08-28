@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, status
 
 from app.services.inventory_health import analyze_inventory_health, build_cycle_count_plan
 from app.services.kitting_baseline import analyze_kitting_baseline
+from app.services.kitting_transactions import inspect_kitting_transactions
 from odoo_client import OdooClientError, OdooWarehouseClient
 
 logger = logging.getLogger(__name__)
@@ -22,7 +23,7 @@ app = FastAPI(
         "connected to Odoo. Operational mutations remain outside this API until "
         "they are protected by explicit human-in-the-loop approval workflows."
     ),
-    version="0.4.0",
+    version="0.5.0",
 )
 
 ANALYSIS_PRODUCT_FIELDS = (
@@ -58,6 +59,45 @@ KITTING_MOVE_FIELDS = (
     "qty_done",
     "date",
     "state",
+    "write_uid",
+)
+
+KITTING_TRANSACTION_MO_FIELDS = (
+    "id",
+    "name",
+    "origin",
+    "state",
+    "product_id",
+    "bom_id",
+    "picking_ids",
+    "date_start",
+    "date_finished",
+)
+
+KITTING_TRANSACTION_MOVE_FIELDS = (
+    "id",
+    "picking_id",
+    "product_id",
+    "product_uom_qty",
+    "quantity",
+    "state",
+    "picked",
+    "location_id",
+    "location_dest_id",
+)
+
+KITTING_TRANSACTION_LINE_FIELDS = (
+    "id",
+    "move_id",
+    "picking_id",
+    "product_id",
+    "quantity",
+    "picked",
+    "location_id",
+    "location_dest_id",
+    "state",
+    "date",
+    "lot_id",
     "write_uid",
 )
 
@@ -147,6 +187,97 @@ def _build_kitting_baseline_report(
     return report
 
 
+def _build_kitting_transaction_report(
+    client: OdooWarehouseClient,
+    *,
+    source_limit: int,
+    origin_prefix: str,
+    picking_type_contains: str,
+) -> dict[str, Any]:
+    try:
+        mo_fields = client._resolve_fields(
+            "mrp.production", KITTING_TRANSACTION_MO_FIELDS, KITTING_TRANSACTION_MO_FIELDS
+        )
+        picking_fields = client._resolve_fields(
+            "stock.picking", KITTING_PICKING_FIELDS, KITTING_PICKING_FIELDS
+        )
+        move_fields = client._resolve_fields(
+            "stock.move", KITTING_TRANSACTION_MOVE_FIELDS, KITTING_TRANSACTION_MOVE_FIELDS
+        )
+        line_fields = client._resolve_fields(
+            "stock.move.line", KITTING_TRANSACTION_LINE_FIELDS, KITTING_TRANSACTION_LINE_FIELDS
+        )
+
+        mo_domain: list[Any] = []
+        if origin_prefix:
+            mo_domain.append(["origin", "=ilike", f"{origin_prefix}%"])
+        manufacturing_orders = client.search_read(
+            "mrp.production",
+            domain=mo_domain,
+            fields=mo_fields,
+            limit=source_limit,
+            order="id asc",
+        )
+
+        picking_ids: set[int] = set()
+        for mo in manufacturing_orders:
+            for picking_id in mo.get("picking_ids") or []:
+                if isinstance(picking_id, int):
+                    picking_ids.add(picking_id)
+
+        pickings: list[dict[str, Any]] = []
+        if picking_ids:
+            pickings = client.search_read(
+                "stock.picking",
+                domain=[["id", "in", sorted(picking_ids)]],
+                fields=picking_fields,
+                limit=source_limit,
+                order="id asc",
+            )
+
+        resolved_picking_ids = [row["id"] for row in pickings if isinstance(row.get("id"), int)]
+        stock_moves: list[dict[str, Any]] = []
+        move_lines: list[dict[str, Any]] = []
+        if resolved_picking_ids:
+            stock_moves = client.search_read(
+                "stock.move",
+                domain=[["picking_id", "in", resolved_picking_ids]],
+                fields=move_fields,
+                limit=source_limit,
+                order="picking_id asc, id asc",
+            )
+            move_lines = client.search_read(
+                "stock.move.line",
+                domain=[["picking_id", "in", resolved_picking_ids]],
+                fields=line_fields,
+                limit=source_limit,
+                order="picking_id asc, id asc",
+            )
+    except OdooClientError as exc:
+        raise _odoo_unavailable(exc) from exc
+
+    report = inspect_kitting_transactions(
+        manufacturing_orders,
+        pickings,
+        stock_moves,
+        move_lines,
+        origin_prefix=origin_prefix,
+        picking_type_contains=picking_type_contains,
+    )
+    report["source_snapshot"] = {
+        "manufacturing_orders": len(manufacturing_orders),
+        "pickings": len(pickings),
+        "stock_moves": len(stock_moves),
+        "move_lines": len(move_lines),
+        "source_limit_per_model": source_limit,
+        "truncated_possible": any(
+            len(records) >= source_limit
+            for records in (manufacturing_orders, pickings, stock_moves, move_lines)
+        ),
+    }
+    return report
+
+
 @app.get("/", tags=["system"])
 def root() -> dict[str, Any]:
     return {
@@ -159,6 +290,7 @@ def root() -> dict[str, Any]:
             "inventory_health": "/api/inventory-health",
             "cycle_count_plan": "/api/cycle-count-plan",
             "kitting_baseline": "/api/kitting-baseline",
+            "kitting_transactions": "/api/kitting-transactions",
             "docs": "/docs",
         },
     }
@@ -198,6 +330,21 @@ def stock_moves(limit: int = Query(default=100, ge=1, le=5000), client: OdooWare
 @app.get("/api/manufacturing-orders", tags=["manufacturing"])
 def manufacturing_orders(limit: int = Query(default=100, ge=1, le=5000), client: OdooWarehouseClient = Depends(get_odoo_client)) -> dict[str, Any]:
     return _fetch_records(client.fetch_manufacturing_orders, limit)
+
+
+@app.get("/api/kitting-transactions", tags=["manufacturing", "analytics"])
+def kitting_transactions(
+    source_limit: int = Query(default=5000, ge=100, le=20000),
+    origin_prefix: str = Query(default="AWIA-MOCK-MO-", min_length=0, max_length=100),
+    picking_type_contains: str = Query(default="Pick Components", min_length=0, max_length=100),
+    client: OdooWarehouseClient = Depends(get_odoo_client),
+) -> dict[str, Any]:
+    return _build_kitting_transaction_report(
+        client,
+        source_limit=source_limit,
+        origin_prefix=origin_prefix,
+        picking_type_contains=picking_type_contains,
+    )
 
 
 @app.get("/api/kitting-baseline", tags=["manufacturing", "analytics"])
