@@ -94,3 +94,40 @@ def test_closed_session_rejects_new_events(tmp_path):
 
     with pytest.raises(SessionStateError, match="events can only be appended"):
         store.append_event(session_id, "note", metadata={"message": "late"})
+
+
+def test_staged_session_metadata_can_be_retagged_without_changing_events(tmp_path):
+    store = KittingEventStore(tmp_path / "events.sqlite3")
+    session = store.start_session(
+        SessionIdentity(picking_id=5),
+        operator="virtual-picker-v1",
+        layout_version="mock-v1",
+        route_algorithm_version="manual-observed-v1",
+    )
+    session_id = session["session_id"]
+    store.append_event(session_id, "item_scan", product_code="A", quantity=1)
+    store.append_event(session_id, "stage_complete")
+    events_before = store.events_for_session(session_id)
+
+    updated = store.update_session_metadata(
+        session_id,
+        route_algorithm_version="virtual-picker-nearest-neighbor-v1",
+    )
+
+    assert updated["status"] == "staged"
+    assert updated["route_algorithm_version"] == "virtual-picker-nearest-neighbor-v1"
+    assert store.events_for_session(session_id) == events_before
+
+
+def test_closed_session_metadata_retagging_is_blocked(tmp_path):
+    store = KittingEventStore(tmp_path / "events.sqlite3")
+    session = store.start_session(SessionIdentity(picking_id=5))
+    session_id = session["session_id"]
+    store.append_event(session_id, "stage_complete")
+    store.close_session(session_id)
+
+    with pytest.raises(SessionStateError, match="metadata can only be changed"):
+        store.update_session_metadata(
+            session_id,
+            route_algorithm_version="virtual-picker-nearest-neighbor-v1",
+        )
