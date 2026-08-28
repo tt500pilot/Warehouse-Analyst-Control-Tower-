@@ -1,6 +1,6 @@
 """Inspect native Odoo manufacturing-to-kitting transaction relationships.
 
-This module is deliberately descriptive, not transactional.  It links AWIA
+This module is deliberately descriptive, not transactional. It links AWIA
 manufacturing orders to Odoo's native Pick Components transfers, stock moves,
 and reserved move lines without validating or completing any warehouse work.
 """
@@ -37,6 +37,11 @@ def _number(value: Any) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     return 0.0
+
+
+def _tracking(value: Any) -> str:
+    text = str(value or "none").strip().lower()
+    return text if text in {"none", "lot", "serial"} else "none"
 
 
 def inspect_kitting_transactions(
@@ -78,11 +83,7 @@ def inspect_kitting_transactions(
             picking_by_origin[origin].append(row)
 
     moves_by_picking: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    move_by_id: dict[int, dict[str, Any]] = {}
     for row in stock_moves:
-        move_id = row.get("id")
-        if isinstance(move_id, int):
-            move_by_id[move_id] = row
         picking_id = _m2o_id(row.get("picking_id"))
         if picking_id is not None:
             moves_by_picking[picking_id].append(row)
@@ -103,6 +104,12 @@ def inspect_kitting_transactions(
     picking_states: Counter[str] = Counter()
     total_component_moves = 0
     total_move_lines = 0
+    tracked_component_moves = 0
+    tracked_move_lines = 0
+    tracking_assigned_lines = 0
+    tracking_missing_lines = 0
+    reservation_incomplete_moves = 0
+    execution_ready_transfers = 0
 
     for mo in sorted(mos, key=lambda row: int(row.get("id") or 0)):
         mo_state = str(mo.get("state") or "unknown")
@@ -127,6 +134,7 @@ def inspect_kitting_transactions(
             picking_states[picking_state] += 1
 
             component_rows: list[dict[str, Any]] = []
+            transfer_ready = picking_state == "assigned"
             for move in sorted(moves_by_picking.get(picking_id, []), key=lambda row: int(row.get("id") or 0)):
                 move_id = move.get("id")
                 reserved_lines = lines_by_move.get(move_id, []) if isinstance(move_id, int) else []
@@ -145,13 +153,59 @@ def inspect_kitting_transactions(
                     }
                 )
                 reserved_quantity = round(sum(_number(line.get("quantity")) for line in reserved_lines), 6)
+                demand_quantity = _number(move.get("product_uom_qty"))
+                reservation_complete = reserved_quantity + 1e-6 >= demand_quantity
+                if not reservation_complete:
+                    reservation_incomplete_moves += 1
+
+                move_tracking = _tracking(move.get("has_tracking"))
+                tracking_required = move_tracking in {"lot", "serial"}
+                if tracking_required:
+                    tracked_component_moves += 1
+
+                assigned_count = 0
+                missing_count = 0
+                tracking_rows: list[dict[str, Any]] = []
+                for line in reserved_lines:
+                    line_quantity = _number(line.get("quantity"))
+                    line_tracking = _tracking(line.get("tracking") or move_tracking)
+                    requires_tracking = line_tracking in {"lot", "serial"} and line_quantity > 0
+                    lot_id = _m2o_id(line.get("lot_id"))
+                    lot_label = _m2o_label(line.get("lot_id"))
+                    lot_name = str(line.get("lot_name") or "").strip() or None
+                    has_tracking_value = bool(lot_id or lot_name)
+                    if requires_tracking:
+                        tracked_move_lines += 1
+                        if has_tracking_value:
+                            assigned_count += 1
+                            tracking_assigned_lines += 1
+                        else:
+                            missing_count += 1
+                            tracking_missing_lines += 1
+                    tracking_rows.append(
+                        {
+                            "move_line_id": line.get("id"),
+                            "quantity": line_quantity,
+                            "tracking": line_tracking,
+                            "lot_id": lot_id,
+                            "lot": lot_label,
+                            "lot_name": lot_name,
+                            "tracking_assigned": (not requires_tracking) or has_tracking_value,
+                        }
+                    )
+
+                component_ready = reservation_complete and missing_count == 0
+                transfer_ready = transfer_ready and component_ready
                 component_rows.append(
                     {
                         "stock_move_id": move_id,
                         "product_id": _m2o_id(move.get("product_id")),
                         "product": _m2o_label(move.get("product_id")),
-                        "demand_quantity": _number(move.get("product_uom_qty")),
+                        "tracking": move_tracking,
+                        "tracking_required": tracking_required,
+                        "demand_quantity": demand_quantity,
                         "reserved_line_quantity": reserved_quantity,
+                        "reservation_complete": reservation_complete,
                         "move_state": move.get("state"),
                         "picked": bool(move.get("picked", False)),
                         "planned_source_location": _m2o_label(move.get("location_id")),
@@ -159,10 +213,16 @@ def inspect_kitting_transactions(
                         "reserved_source_locations": source_locations,
                         "reserved_destination_locations": destination_locations,
                         "reservation_line_count": len(reserved_lines),
+                        "tracking_assigned_line_count": assigned_count,
+                        "tracking_missing_line_count": missing_count,
+                        "execution_ready": component_ready,
+                        "reservation_lines": tracking_rows,
                     }
                 )
             total_component_moves += len(component_rows)
             total_move_lines += len(lines_by_picking.get(picking_id, []))
+            if transfer_ready:
+                execution_ready_transfers += 1
             picking_rows.append(
                 {
                     "picking_id": picking_id,
@@ -177,6 +237,7 @@ def inspect_kitting_transactions(
                     "date_done": picking.get("date_done"),
                     "component_move_count": len(component_rows),
                     "move_line_count": len(lines_by_picking.get(picking_id, [])),
+                    "execution_ready": transfer_ready,
                     "components": component_rows,
                 }
             )
@@ -212,6 +273,13 @@ def inspect_kitting_transactions(
             "ready_transfers": ready_transfers,
             "partially_available_transfers": partial_transfers,
             "waiting_transfers": waiting_transfers,
+            "tracked_component_moves": tracked_component_moves,
+            "tracked_reservation_lines": tracked_move_lines,
+            "tracking_assigned_lines": tracking_assigned_lines,
+            "tracking_missing_lines": tracking_missing_lines,
+            "reservation_incomplete_moves": reservation_incomplete_moves,
+            "execution_ready_transfers": execution_ready_transfers,
+            "all_transfers_execution_ready": bool(linked_picking_ids) and execution_ready_transfers == len(linked_picking_ids),
             "all_manufacturing_orders_linked": bool(transactions) and linked_mos == len(transactions),
             "mo_states": dict(sorted(mo_states.items())),
             "picking_states": dict(sorted(picking_states.items())),
@@ -219,6 +287,8 @@ def inspect_kitting_transactions(
         "methodology": {
             "linkage": "Prefer native mrp.production.picking_ids; fall back to stock.picking.origin matching the MO reference.",
             "reservation_quantity": "reserved_line_quantity is the sum of native stock.move.line.quantity on the open transfer. It is reservation/operation evidence, not completed picked quantity unless the move is actually picked/done.",
+            "tracking": "A lot/serial-tracked reservation line with positive quantity is execution-ready only when native lot_id or lot_name is present.",
+            "execution_readiness": "A transfer is execution-ready only when it is assigned, every component demand is fully reserved, and every tracked reservation line has lot/serial evidence.",
             "timing": "Open transfers are inspection data only. Cycle-time KPIs remain restricted to completed pickings in /api/kitting-baseline.",
             "mutations": "This inspector is read-only and never validates, picks, or completes Odoo transfers.",
         },
