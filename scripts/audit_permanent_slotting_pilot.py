@@ -4,12 +4,19 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from app.services.relocation_planner import _build_live_state
+from app.services.slotting_feasibility import (
+    _live_quants_for_locations,
+    _m2o_id,
+    _product_index,
+    build_live_location_index,
+)
 from app.services.slotting_optimizer import load_slotting_product_metadata, optimize_slotting_layout
 from app.services.virtual_picker import PickerAssumptions
 from odoo_client import OdooWarehouseClient
@@ -22,6 +29,129 @@ from scripts.optimize_holdout_slotting import (
     build_reservations,
 )
 from scripts.rank_permanent_slotting_candidates import _distance_between, _single_training_source
+
+
+def _traceability_state(
+    client: OdooWarehouseClient,
+    *,
+    product_code: str,
+    source_tail: str,
+) -> dict[str, Any]:
+    locations = build_live_location_index(client)
+    source_location = locations.get(source_tail)
+    if not source_location or not isinstance(source_location.get("id"), int):
+        raise RuntimeError(f"Source {source_tail} is not mapped to a live Odoo internal location.")
+    source_location_id = int(source_location["id"])
+
+    product_rows = client.search_read(
+        "product.product",
+        domain=[["default_code", "=", product_code]],
+        fields=[
+            field
+            for field in ("id", "default_code", "name", "tracking")
+            if field in set(client.available_fields("product.product"))
+        ],
+        limit=2,
+        order="id asc",
+    )
+    if len(product_rows) != 1 or not isinstance(product_rows[0].get("id"), int):
+        raise RuntimeError(
+            f"Expected exactly one live Odoo product for {product_code}; found {len(product_rows)}."
+        )
+    product_id = int(product_rows[0]["id"])
+    product = _product_index(client, {product_id}).get(product_id, product_rows[0])
+    tracking = str(product.get("tracking") or "none")
+
+    quants = [
+        row
+        for row in _live_quants_for_locations(client, [source_location_id])
+        if _m2o_id(row.get("product_id")) == product_id
+    ]
+    traced_rows = [row for row in quants if _m2o_id(row.get("lot_id")) is not None]
+    anonymous_rows = [row for row in quants if _m2o_id(row.get("lot_id")) is None]
+
+    def qty(rows: list[dict[str, Any]], field: str) -> float:
+        return round(sum(float(row.get(field) or 0.0) for row in rows), 3)
+
+    lot_ids = sorted(
+        {
+            lot_id
+            for row in traced_rows
+            for lot_id in [_m2o_id(row.get("lot_id"))]
+            if lot_id is not None
+        }
+    )
+    lot_names: dict[int, str] = {}
+    if lot_ids:
+        lot_rows = client.search_read(
+            "stock.lot",
+            domain=[["id", "in", lot_ids]],
+            fields=[
+                field
+                for field in ("id", "name", "product_id")
+                if field in set(client.available_fields("stock.lot"))
+            ],
+            limit=10000,
+            order="id asc",
+        )
+        lot_names = {
+            int(row["id"]): str(row.get("name") or "")
+            for row in lot_rows
+            if isinstance(row.get("id"), int)
+        }
+
+    traced_details = []
+    serial_quantity_violations = []
+    for row in traced_rows:
+        lot_id = _m2o_id(row.get("lot_id"))
+        quantity = float(row.get("quantity") or 0.0)
+        detail = {
+            "quant_id": row.get("id"),
+            "lot_or_serial_id": lot_id,
+            "lot_or_serial_name": lot_names.get(lot_id or -1),
+            "quantity": round(quantity, 3),
+            "reserved_quantity": round(float(row.get("reserved_quantity") or 0.0), 3),
+        }
+        traced_details.append(detail)
+        if tracking == "serial" and quantity > 1.000001:
+            serial_quantity_violations.append(detail)
+
+    anonymous_quantity = qty(anonymous_rows, "quantity")
+    fully_traceable = (
+        anonymous_quantity <= 1e-9
+        and not serial_quantity_violations
+        and (tracking != "serial" or qty(traced_rows, "quantity") <= len(lot_ids) + 1e-9)
+    )
+
+    return {
+        "product_id": product_id,
+        "tracking": tracking,
+        "source_location_id": source_location_id,
+        "source_location": source_tail,
+        "total_quantity": qty(quants, "quantity"),
+        "total_reserved_quantity": qty(quants, "reserved_quantity"),
+        "traced_quantity": qty(traced_rows, "quantity"),
+        "traced_reserved_quantity": qty(traced_rows, "reserved_quantity"),
+        "anonymous_quantity": anonymous_quantity,
+        "anonymous_reserved_quantity": qty(anonymous_rows, "reserved_quantity"),
+        "lot_or_serial_ids": lot_ids,
+        "lot_or_serial_count": len(lot_ids),
+        "traced_quant_rows": traced_details,
+        "anonymous_quant_rows": [
+            {
+                "quant_id": row.get("id"),
+                "quantity": round(float(row.get("quantity") or 0.0), 3),
+                "reserved_quantity": round(float(row.get("reserved_quantity") or 0.0), 3),
+            }
+            for row in anonymous_rows
+        ],
+        "serial_quantity_violations": serial_quantity_violations,
+        "fully_traceable_for_full_stock_relocation": fully_traceable,
+        "note": (
+            "The existing AWIA tracking migration was demand-scoped. Anonymous remainder is expected "
+            "until a full-stock relocation pilot explicitly serializes or lot-identifies the stock."
+        ),
+    }
 
 
 def main() -> None:
@@ -67,7 +197,11 @@ def main() -> None:
     live_quantity = sum(float(row["quantity"]) for row in positions)
     live_reserved = sum(float(row["reserved_quantity"]) for row in positions)
     live_weight = sum(float(row["weight_lb"]) for row in positions)
-    lot_ids = sorted({lot for row in positions for lot in row.get("lot_ids", [])})
+    traceability = _traceability_state(
+        client,
+        product_code=args.product_code,
+        source_tail=source,
+    )
 
     target_bin = bins.get(target)
     if target_bin is None:
@@ -101,6 +235,8 @@ def main() -> None:
     blockers: list[str] = []
     if live_reserved > 0:
         blockers.append("native_odoo_reservation_release_or_reassignment_required")
+    if not traceability["fully_traceable_for_full_stock_relocation"]:
+        blockers.append("tracked_full_stock_not_fully_lot_or_serial_identified")
     if other_occupants:
         blockers.append("target_occupied_requires_displacement")
     if capacity_anomalies:
@@ -110,6 +246,19 @@ def main() -> None:
     blockers.append("material_handling_equipment_assumptions_not_defined")
     blockers.append("fresh_blind_validation_set_not_created")
     blockers.append("human_approval_required")
+
+    required_before_move = [
+        "replace or calibrate target physical capacity using real dimensions/load rating",
+        "define actual material-handling method for this load",
+        "create a fresh blind validation set before changing the layout",
+        "plan native Odoo reservation release/reassignment without losing lot/serial traceability",
+        "obtain human approval",
+    ]
+    if not traceability["fully_traceable_for_full_stock_relocation"]:
+        required_before_move.insert(
+            0,
+            "fully lot/serial-identify the stock that will be physically relocated; do not treat anonymous tracked stock as move-ready",
+        )
 
     result = {
         "mode": "read_only_permanent_slotting_pilot_readiness",
@@ -123,10 +272,9 @@ def main() -> None:
             "quantity": round(live_quantity, 3),
             "reserved_quantity": round(live_reserved, 3),
             "estimated_weight_lb": round(live_weight, 3),
-            "lot_or_serial_ids": lot_ids,
-            "lot_or_serial_count": len(lot_ids),
             "positions": positions,
         },
+        "traceability": traceability,
         "target_state": {
             "currently_empty": float(target_bin["total_units"]) <= 0,
             "other_occupants": other_occupants,
@@ -160,13 +308,7 @@ def main() -> None:
         "pilot_gate": {
             "ready_for_physical_move": False,
             "blockers": blockers,
-            "required_before_move": [
-                "replace or calibrate target physical capacity using real dimensions/load rating",
-                "define actual material-handling method for this load",
-                "create a fresh blind validation set before changing the layout",
-                "plan native Odoo reservation release/reassignment without losing lot/serial traceability",
-                "obtain human approval",
-            ],
+            "required_before_move": required_before_move,
         },
         "recommended_experiment": {
             "scope": "single-SKU permanent relocation pilot",
