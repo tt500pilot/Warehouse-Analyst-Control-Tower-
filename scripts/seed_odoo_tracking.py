@@ -2,34 +2,13 @@
 
 The first AWIA sandbox seed intentionally proved basic inventory connectivity.
 It created on-hand quantities even for tracked products without lot/serial IDs.
-This follow-on migration upgrades only the quantity needed by the currently open
-AWIA Pick Components transfers.
+This migration upgrades only the quantity needed by currently open AWIA Pick
+Components transfers.
 
-Why demand-scoped instead of serializing the whole sandbox?
-A full conversion would create thousands of serial records that are irrelevant
-to the current 12-kit workflow. This script instead moves just the required
-quantity from anonymous tracked stock into deterministic lot/serial quants,
-lets Odoo rebuild the reservations, and restores the remaining anonymous stock.
-Total on-hand quantity is preserved.
-
-Workflow on --apply:
-1. Identify the open AWIA Pick Components reservation lines that require
-   lot/serial tracking but currently have no lot_id.
-2. Snapshot anonymous on-hand stock by product + physical source location.
-3. Unlink only those missing-traceability reservation lines. Odoo natively
-   releases the corresponding reservations when stock.move.line is unlinked.
-4. Temporarily zero the relevant anonymous quants so Odoo cannot reserve them.
-5. Create deterministic lot/serial stock equal to the current kitting demand.
-6. Call stock.picking.action_assign() to rebuild reservations from traced stock.
-7. Restore the anonymous remainder so total warehouse on-hand is unchanged.
-
-Safety properties:
-- dry-run by default
-- same sandbox write guard as the other seeders
-- refuses done/cancelled AWIA Pick Components transfers
-- mutates only tracked reservation lines that are missing lot/serial evidence
-- deterministic lot/serial names make interrupted reruns recoverable
-- never bypasses Odoo validation and never writes PostgreSQL directly
+On --apply it releases only missing-traceability reservations, temporarily
+isolates the relevant anonymous tracked stock, creates deterministic lot/serial
+stock equal to current demand, asks Odoo to reserve it, then restores the
+anonymous remainder. Total managed on-hand quantity is preserved.
 """
 
 from __future__ import annotations
@@ -55,9 +34,17 @@ LOT_PREFIX = "A"
 
 
 def _m2o_id(value: Any) -> int | None:
+    """Normalize an Odoo many2one value without treating False as integer 0."""
+    if isinstance(value, bool):
+        return None
     if isinstance(value, int):
         return value
-    if isinstance(value, (list, tuple)) and value and isinstance(value[0], int):
+    if (
+        isinstance(value, (list, tuple))
+        and value
+        and isinstance(value[0], int)
+        and not isinstance(value[0], bool)
+    ):
         return value[0]
     return None
 
@@ -149,7 +136,7 @@ def merge_product_tracking(
     products: list[dict[str, Any]],
     moves: list[dict[str, Any]],
 ) -> dict[int, dict[str, Any]]:
-    """Prefer stock.move.has_tracking, the same signal used by readiness checks."""
+    """Prefer stock.move.has_tracking, matching the readiness inspector."""
     tracking_by_product: dict[int, str] = {}
     for move in moves:
         product_id = _m2o_id(move.get("product_id"))
@@ -160,7 +147,7 @@ def merge_product_tracking(
     result: dict[int, dict[str, Any]] = {}
     for product in products:
         product_id = product.get("id")
-        if not isinstance(product_id, int):
+        if not isinstance(product_id, int) or isinstance(product_id, bool):
             continue
         enriched = dict(product)
         if product_id in tracking_by_product:
@@ -204,7 +191,7 @@ def _resolve_awia_kitting_scope(
             picking_id
             for mo in mos
             for picking_id in (mo.get("picking_ids") or [])
-            if isinstance(picking_id, int)
+            if isinstance(picking_id, int) and not isinstance(picking_id, bool)
         }
     )
     if not picking_ids:
@@ -232,7 +219,11 @@ def _resolve_awia_kitting_scope(
             f"Refusing tracking migration because AWIA Pick Components transfers are already done/cancelled: {names}."
         )
 
-    pbm_ids = [int(row["id"]) for row in pbm_pickings if isinstance(row.get("id"), int)]
+    pbm_ids = [
+        int(row["id"])
+        for row in pbm_pickings
+        if isinstance(row.get("id"), int) and not isinstance(row.get("id"), bool)
+    ]
     move_fields = ["id", "picking_id", "product_id", "has_tracking", "state"]
     moves = client.search_read(
         "stock.move",
@@ -249,7 +240,11 @@ def _resolve_awia_kitting_scope(
             if product_id is not None
         }
     )
-    product_fields = [field for field in ("id", "default_code", "tracking") if field in set(client.available_fields("product.product"))]
+    product_fields = [
+        field
+        for field in ("id", "default_code", "tracking")
+        if field in set(client.available_fields("product.product"))
+    ]
     products = client.search_read(
         "product.product",
         domain=[["id", "in", product_ids]],
@@ -344,7 +339,7 @@ def _ensure_lot(
         [["product_id", "=", product_id], ["name", "=", lot_name]],
         ["id", "name", "product_id"],
     )
-    if existing and isinstance(existing.get("id"), int):
+    if existing and isinstance(existing.get("id"), int) and not isinstance(existing.get("id"), bool):
         return int(existing["id"]), "existing"
     lot_id = client.execute_kw(
         "stock.lot",
@@ -398,7 +393,7 @@ def _set_quant_target(
         ["id", "quantity", "reserved_quantity", "lot_id"],
     )
     context = {"inventory_mode": True}
-    if existing and isinstance(existing.get("id"), int):
+    if existing and isinstance(existing.get("id"), int) and not isinstance(existing.get("id"), bool):
         client.execute_kw(
             "stock.quant",
             "write",
@@ -523,7 +518,7 @@ def migrate_tracking(
     missing_line_ids = [
         int(row["id"])
         for row in scope["missing_tracking_lines"]
-        if isinstance(row.get("id"), int)
+        if isinstance(row.get("id"), int) and not isinstance(row.get("id"), bool)
     ]
     client.execute_kw("stock.move.line", "unlink", args=[missing_line_ids])
     print(f"Anonymous tracked reservations released: {len(missing_line_ids)}", flush=True)
