@@ -29,8 +29,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Run the full read-only AWIA decision pipeline for any already validated canonical mapped-area geometry. "
-            "The runner orchestrates slotting, matched route validation, relocation readiness, economics sensitivity, "
-            "pilot decision, and manager report generation. It does not create geometry and does not write Odoo."
+            "The runner orchestrates slotting, matched route validation, relocation readiness, individual economics, "
+            "co-pick package economics, pilot decision, and manager report generation. It does not create geometry and does not write Odoo."
         )
     )
     parser.add_argument(
@@ -94,6 +94,7 @@ def main() -> None:
     route = output_dir / f"{area_slug}-route-validation.json"
     readiness = output_dir / f"{area_slug}-relocation-readiness.json"
     economics = output_dir / f"{area_slug}-relocation-economics.json"
+    copick_packages = output_dir / f"{area_slug}-copick-package-economics.json"
     decision = output_dir / f"{area_slug}-pilot-decision.json"
     report_md = output_dir / f"{area_slug}-decision-report.md"
     report_json = output_dir / f"{area_slug}-decision-report.json"
@@ -170,6 +171,22 @@ def main() -> None:
     )
 
     _run(
+        "co-pick package economics",
+        [
+            python,
+            str(scripts / "analyze_mapped_aisle_copick_packages.py"),
+            "--readiness",
+            str(readiness),
+            "--route-validation",
+            str(route),
+            "--setup-minutes",
+            args.economics_setup_minutes,
+            "--output",
+            str(copick_packages),
+        ],
+    )
+
+    _run(
         "pilot decision gate",
         [
             python,
@@ -214,6 +231,7 @@ def main() -> None:
     )
 
     decision_payload = json.loads(decision.read_text(encoding="utf-8"))
+    package_payload = json.loads(copick_packages.read_text(encoding="utf-8"))
     final = {
         "mode": "mapped_area_decision_pipeline",
         "odoo_mutated": False,
@@ -221,11 +239,13 @@ def main() -> None:
         "area_slug": area_slug,
         "geometry": str(geometry),
         "decision_summary": decision_payload.get("summary") or {},
+        "copick_package_summary": package_payload.get("summary") or {},
         "outputs": {
             "slotting": str(slotting),
             "route_validation": str(route),
             "relocation_readiness": str(readiness),
             "relocation_economics": str(economics),
+            "copick_package_economics": str(copick_packages),
             "pilot_decision": str(decision),
             "manager_report_markdown": str(report_md),
             "manager_report_json": str(report_json),
@@ -233,6 +253,7 @@ def main() -> None:
         "guardrails": [
             "This runner requires an already validated canonical geometry artifact; it does not infer real warehouse geometry.",
             "The pipeline is advisory/read-only and performs no Odoo writes.",
+            "Shared co-pick route benefits are evaluated as packages instead of being arbitrarily allocated to individual SKUs.",
             "READY_FOR_CONTROLLED_PILOT is not execution authorization; human approval remains required.",
             "Synthetic fixture inputs must never be represented as Firefly production performance.",
         ],
