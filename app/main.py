@@ -23,7 +23,7 @@ app = FastAPI(
         "connected to Odoo. Operational mutations remain outside this API until "
         "they are protected by explicit human-in-the-loop approval workflows."
     ),
-    version="0.5.0",
+    version="0.5.1",
 )
 
 ANALYSIS_PRODUCT_FIELDS = (
@@ -62,6 +62,13 @@ KITTING_MOVE_FIELDS = (
     "write_uid",
 )
 
+KITTING_BASELINE_MO_FIELDS = (
+    "id",
+    "name",
+    "origin",
+    "picking_ids",
+)
+
 KITTING_TRANSACTION_MO_FIELDS = (
     "id",
     "name",
@@ -82,6 +89,7 @@ KITTING_TRANSACTION_MOVE_FIELDS = (
     "quantity",
     "state",
     "picked",
+    "has_tracking",
     "location_id",
     "location_dest_id",
 )
@@ -93,11 +101,13 @@ KITTING_TRANSACTION_LINE_FIELDS = (
     "product_id",
     "quantity",
     "picked",
+    "tracking",
     "location_id",
     "location_dest_id",
     "state",
     "date",
     "lot_id",
+    "lot_name",
     "write_uid",
 )
 
@@ -148,20 +158,53 @@ def _build_kitting_baseline_report(
     client: OdooWarehouseClient,
     *,
     source_limit: int,
+    origin_prefix: str,
     picking_type_contains: str,
 ) -> dict[str, Any]:
     try:
-        picking_fields = client._resolve_fields("stock.picking", KITTING_PICKING_FIELDS, KITTING_PICKING_FIELDS)
-        move_fields = client._resolve_fields("stock.move.line", KITTING_MOVE_FIELDS, KITTING_MOVE_FIELDS)
+        mo_fields = client._resolve_fields(
+            "mrp.production", KITTING_BASELINE_MO_FIELDS, KITTING_BASELINE_MO_FIELDS
+        )
+        picking_fields = client._resolve_fields(
+            "stock.picking", KITTING_PICKING_FIELDS, KITTING_PICKING_FIELDS
+        )
+        move_fields = client._resolve_fields(
+            "stock.move.line", KITTING_MOVE_FIELDS, KITTING_MOVE_FIELDS
+        )
+
+        manufacturing_orders: list[dict[str, Any]] = []
+        picking_domain: list[Any] = [["state", "=", "done"]]
+        if origin_prefix:
+            manufacturing_orders = client.search_read(
+                "mrp.production",
+                domain=[["origin", "=ilike", f"{origin_prefix}%"]],
+                fields=mo_fields,
+                limit=source_limit,
+                order="id asc",
+            )
+            awia_picking_ids = sorted(
+                {
+                    picking_id
+                    for mo in manufacturing_orders
+                    for picking_id in (mo.get("picking_ids") or [])
+                    if isinstance(picking_id, int) and not isinstance(picking_id, bool)
+                }
+            )
+            picking_domain.append(["id", "in", awia_picking_ids])
+
         pickings = client.search_read(
             "stock.picking",
-            domain=[["state", "=", "done"]],
+            domain=picking_domain,
             fields=picking_fields,
             limit=source_limit,
             order="date_done desc, id desc",
         )
-        picking_ids = [record["id"] for record in pickings if isinstance(record.get("id"), int)]
-        moves = []
+        picking_ids = [
+            record["id"]
+            for record in pickings
+            if isinstance(record.get("id"), int) and not isinstance(record.get("id"), bool)
+        ]
+        moves: list[dict[str, Any]] = []
         if picking_ids:
             moves = client.search_read(
                 "stock.move.line",
@@ -179,10 +222,15 @@ def _build_kitting_baseline_report(
         picking_type_contains=picking_type_contains,
     )
     report["source_snapshot"] = {
+        "origin_prefix": origin_prefix,
+        "manufacturing_orders": len(manufacturing_orders),
         "done_pickings": len(pickings),
         "move_lines": len(moves),
         "source_limit_per_model": source_limit,
-        "truncated_possible": len(pickings) >= source_limit or len(moves) >= source_limit,
+        "truncated_possible": any(
+            len(records) >= source_limit
+            for records in (manufacturing_orders, pickings, moves)
+        ),
     }
     return report
 
@@ -222,7 +270,7 @@ def _build_kitting_transaction_report(
         picking_ids: set[int] = set()
         for mo in manufacturing_orders:
             for picking_id in mo.get("picking_ids") or []:
-                if isinstance(picking_id, int):
+                if isinstance(picking_id, int) and not isinstance(picking_id, bool):
                     picking_ids.add(picking_id)
 
         pickings: list[dict[str, Any]] = []
@@ -235,7 +283,11 @@ def _build_kitting_transaction_report(
                 order="id asc",
             )
 
-        resolved_picking_ids = [row["id"] for row in pickings if isinstance(row.get("id"), int)]
+        resolved_picking_ids = [
+            row["id"]
+            for row in pickings
+            if isinstance(row.get("id"), int) and not isinstance(row.get("id"), bool)
+        ]
         stock_moves: list[dict[str, Any]] = []
         move_lines: list[dict[str, Any]] = []
         if resolved_picking_ids:
@@ -350,12 +402,14 @@ def kitting_transactions(
 @app.get("/api/kitting-baseline", tags=["manufacturing", "analytics"])
 def kitting_baseline(
     source_limit: int = Query(default=5000, ge=100, le=20000),
+    origin_prefix: str = Query(default="AWIA-MOCK-MO-", min_length=0, max_length=100),
     picking_type_contains: str = Query(default="Pick Components", min_length=0, max_length=100),
     client: OdooWarehouseClient = Depends(get_odoo_client),
 ) -> dict[str, Any]:
     return _build_kitting_baseline_report(
         client,
         source_limit=source_limit,
+        origin_prefix=origin_prefix,
         picking_type_contains=picking_type_contains,
     )
 
