@@ -15,6 +15,14 @@ def _bool(config: Record, key: str) -> bool:
     return bool(config.get(key))
 
 
+def _text(config: Record, key: str) -> str:
+    return str(config.get(key) or "").strip()
+
+
+def _declared_with_evidence(config: Record, flag_key: str, evidence_key: str) -> bool:
+    return _bool(config, flag_key) and bool(_text(config, evidence_key))
+
+
 def _measurement_statuses(geometry: Record) -> list[str]:
     payload = geometry.get("geometry") or geometry
     summary = payload.get("summary") or {}
@@ -31,8 +39,8 @@ def evaluate_production_pilot_readiness(
     """Evaluate whether a mapped area is ready for a controlled read-only production pilot.
 
     This gate never authorizes inventory movement or Odoo writes. A READY result means
-    only that the prerequisite controls for a read-only pilot have been explicitly
-    declared and that the geometry artifact does not contain unapproved provenance.
+    only that prerequisite controls for a read-only pilot have been explicitly declared,
+    evidence references are present, and geometry provenance is approved.
     """
 
     approved_models = {str(value) for value in config.get("approved_odoo_models") or []}
@@ -45,88 +53,148 @@ def evaluate_production_pilot_readiness(
 
     checks: list[dict[str, Any]] = []
 
-    def add(check_id: str, passed: bool, detail: str) -> None:
-        checks.append({"check_id": check_id, "passed": bool(passed), "detail": detail})
+    def add(check_id: str, passed: bool, detail: str, evidence_reference: str = "") -> None:
+        checks.append(
+            {
+                "check_id": check_id,
+                "passed": bool(passed),
+                "detail": detail,
+                "evidence_reference": evidence_reference or None,
+            }
+        )
 
+    read_access_evidence = _text(config, "read_only_odoo_access_evidence")
     add(
         "read_only_odoo_access_approved",
-        _bool(config, "read_only_odoo_access_approved"),
-        "Approved read-only access to the production Odoo subset must be documented.",
+        _declared_with_evidence(
+            config, "read_only_odoo_access_approved", "read_only_odoo_access_evidence"
+        ),
+        "Approved read-only access to the production Odoo subset must be documented with an evidence reference.",
+        read_access_evidence,
     )
+
+    write_disabled_evidence = _text(config, "odoo_write_access_disabled_evidence")
     add(
         "odoo_write_access_disabled",
-        _bool(config, "odoo_write_access_disabled"),
-        "The pilot identity must not possess warehouse write permissions.",
+        _declared_with_evidence(
+            config, "odoo_write_access_disabled", "odoo_write_access_disabled_evidence"
+        ),
+        "The pilot identity must not possess warehouse write permissions, and the access-control evidence must be referenced.",
+        write_disabled_evidence,
     )
+
     missing_models = sorted(REQUIRED_READ_MODELS - approved_models)
+    models_evidence = _text(config, "approved_odoo_models_evidence")
+    models_pass = not missing_models and bool(models_evidence)
     add(
         "required_odoo_models_approved",
-        not missing_models,
+        models_pass,
         (
-            "Approved read models include the minimum warehouse evidence set."
-            if not missing_models
-            else f"Missing approved models: {', '.join(missing_models)}"
+            "Approved read models include the minimum warehouse evidence set and approval evidence is referenced."
+            if models_pass
+            else (
+                f"Missing approved models: {', '.join(missing_models)}"
+                if missing_models
+                else "Approved Odoo model list has no approval evidence reference."
+            )
         ),
+        models_evidence,
     )
+
+    classification_evidence = _text(config, "data_classification_review_evidence")
     add(
         "data_classification_review_complete",
-        _bool(config, "data_classification_review_complete"),
-        "Data classification / export-control / confidentiality review must be complete for the approved subset.",
+        _declared_with_evidence(
+            config,
+            "data_classification_review_complete",
+            "data_classification_review_evidence",
+        ),
+        "Data classification / export-control / confidentiality review must be complete and its approval reference recorded.",
+        classification_evidence,
     )
 
     unapproved_statuses = sorted(set(geometry_statuses) - approved_statuses)
+    geometry_evidence = _text(config, "geometry_verification_evidence")
+    geometry_provenance_pass = bool(geometry_statuses) and not unapproved_statuses
+    geometry_pass = geometry_provenance_pass and bool(geometry_evidence)
+    if not geometry_statuses:
+        geometry_detail = "Geometry artifact does not declare measurement provenance."
+    elif unapproved_statuses:
+        geometry_detail = f"Unapproved geometry measurement statuses: {', '.join(unapproved_statuses)}"
+    elif not geometry_evidence:
+        geometry_detail = (
+            f"Geometry statuses are approved ({', '.join(geometry_statuses)}), but no field-verification evidence reference is recorded."
+        )
+    else:
+        geometry_detail = f"Geometry measurement statuses approved: {', '.join(geometry_statuses)}"
     add(
         "geometry_field_verified",
-        bool(geometry_statuses) and not unapproved_statuses,
+        geometry_pass,
+        geometry_detail,
+        geometry_evidence,
+    )
+
+    evidence_backed_controls = [
         (
-            f"Geometry measurement statuses approved: {', '.join(geometry_statuses)}"
-            if geometry_statuses and not unapproved_statuses
-            else (
-                f"Unapproved geometry measurement statuses: {', '.join(unapproved_statuses)}"
-                if unapproved_statuses
-                else "Geometry artifact does not declare measurement provenance."
-            )
+            "capacity_source_approved",
+            "capacity_source_approved",
+            "capacity_source_evidence",
+            "Bin/unit/weight capacities must come from an approved field-verified or controlled engineering source with evidence reference.",
         ),
-    )
-    add(
-        "capacity_source_approved",
-        _bool(config, "capacity_source_approved"),
-        "Bin/unit/weight capacities must come from an approved field-verified or controlled engineering source.",
-    )
-    add(
-        "product_physical_metadata_source_approved",
-        _bool(config, "product_physical_metadata_source_approved"),
-        "Weight/dimension metadata used for feasibility must come from an approved source.",
-    )
-    add(
-        "material_handling_method_defined",
-        _bool(config, "material_handling_method_defined"),
-        "The physical handling method and applicable equipment constraints must be defined before evaluating relocation labor.",
-    )
-    add(
-        "reservation_control_procedure_defined",
-        _bool(config, "reservation_control_procedure_defined"),
-        "A controlled process for reserved stock release/reassignment must be defined.",
-    )
-    add(
-        "traceability_relocation_workflow_defined",
-        _bool(config, "traceability_relocation_workflow_defined"),
-        "Lot/serial traceability and scan/reconciliation requirements for any future relocation must be defined.",
-    )
-    add(
-        "flight_critical_policy_available",
-        _bool(config, "flight_critical_policy_available"),
-        "The approved subset/policy must expose or otherwise resolve flight-critical eligibility before production recommendations are trusted.",
-    )
+        (
+            "product_physical_metadata_source_approved",
+            "product_physical_metadata_source_approved",
+            "product_physical_metadata_source_evidence",
+            "Weight/dimension metadata used for feasibility must come from an approved source with evidence reference.",
+        ),
+        (
+            "material_handling_method_defined",
+            "material_handling_method_defined",
+            "material_handling_method_reference",
+            "The physical handling method and applicable equipment constraints must be defined and referenced before evaluating relocation labor.",
+        ),
+        (
+            "reservation_control_procedure_defined",
+            "reservation_control_procedure_defined",
+            "reservation_control_procedure_reference",
+            "A controlled process for reserved stock release/reassignment must be defined and referenced.",
+        ),
+        (
+            "traceability_relocation_workflow_defined",
+            "traceability_relocation_workflow_defined",
+            "traceability_relocation_workflow_reference",
+            "Lot/serial traceability and scan/reconciliation requirements for future relocation must be defined and referenced.",
+        ),
+        (
+            "flight_critical_policy_available",
+            "flight_critical_policy_available",
+            "flight_critical_policy_reference",
+            "The approved subset/policy must expose or otherwise resolve flight-critical eligibility, with the governing policy or field reference recorded.",
+        ),
+    ]
+    for check_id, flag_key, evidence_key, detail in evidence_backed_controls:
+        evidence = _text(config, evidence_key)
+        add(
+            check_id,
+            _declared_with_evidence(config, flag_key, evidence_key),
+            detail,
+            evidence,
+        )
+
+    approval_owner = _text(config, "human_approval_owner")
     add(
         "human_approval_owner_defined",
-        bool(str(config.get("human_approval_owner") or "").strip()),
+        bool(approval_owner),
         "A named role, not an automated agent, must own approval of any future controlled pilot action.",
+        approval_owner,
     )
+
+    scope_owner = _text(config, "pilot_scope_owner")
     add(
         "pilot_scope_owner_defined",
-        bool(str(config.get("pilot_scope_owner") or "").strip()),
+        bool(scope_owner),
         "A warehouse/business owner must own the read-only pilot scope and success criteria.",
+        scope_owner,
     )
 
     failed = [row for row in checks if not row["passed"]]
@@ -137,7 +205,8 @@ def evaluate_production_pilot_readiness(
         "odoo_mutated": False,
         "safe_to_execute_inventory_moves": False,
         "status": status,
-        "ready_for_read_only_production_pilot": status == "READY_FOR_READ_ONLY_PRODUCTION_PILOT",
+        "ready_for_read_only_production_pilot": status
+        == "READY_FOR_READ_ONLY_PRODUCTION_PILOT",
         "geometry_measurement_statuses": geometry_statuses,
         "approved_measurement_statuses": sorted(approved_statuses),
         "approved_odoo_models": sorted(approved_models),
@@ -151,7 +220,8 @@ def evaluate_production_pilot_readiness(
         "guardrails": [
             "READY_FOR_READ_ONLY_PRODUCTION_PILOT does not authorize inventory movement, Odoo writes, purchasing, scrapping, or vendor communication.",
             "MOCK_FIXTURE or other unapproved measurement provenance must block production-pilot readiness.",
-            "Approval declarations in the config are evidence inputs and must correspond to real organizational approvals outside the software.",
+            "Boolean declarations without evidence references are insufficient for evidence-backed production controls.",
+            "Evidence references are audit pointers, not independent proof; they must correspond to real organizational approvals outside the software.",
             "The production pilot should use a least-privilege read-only identity and an explicitly approved data subset.",
         ],
     }
