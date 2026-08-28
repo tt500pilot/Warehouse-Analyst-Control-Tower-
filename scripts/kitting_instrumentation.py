@@ -6,6 +6,7 @@ Examples:
   python scripts/kitting_instrumentation.py event --session-id <id> --type item_scan --product-code SEAL-218 --quantity 2
   python scripts/kitting_instrumentation.py stage --session-id <id>
   python scripts/kitting_instrumentation.py retag --session-id <id> --route-algorithm-version virtual-picker-nearest-neighbor-v1
+  python scripts/kitting_instrumentation.py repair-simulated --session-id <id>
   python scripts/kitting_instrumentation.py close --session-id <id>
   python scripts/kitting_instrumentation.py report --session-id <id>
 """
@@ -81,6 +82,9 @@ def main() -> None:
     retag.add_argument("--route-algorithm-version", default=None)
     retag.add_argument("--notes", default=None)
 
+    repair = sub.add_parser("repair-simulated")
+    repair.add_argument("--session-id", required=True)
+
     close = sub.add_parser("close")
     close.add_argument("--session-id", required=True)
     close.add_argument("--cancelled", action="store_true")
@@ -129,6 +133,8 @@ def main() -> None:
             route_algorithm_version=args.route_algorithm_version,
             notes=args.notes,
         )
+    elif args.command == "repair-simulated":
+        payload = store.repair_simulated_session(args.session_id)
     elif args.command == "close":
         payload = store.close_session(args.session_id, cancelled=args.cancelled)
     elif args.command == "report":
