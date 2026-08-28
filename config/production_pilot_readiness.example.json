@@ -1,0 +1,21 @@
+{
+  "read_only_odoo_access_approved": false,
+  "odoo_write_access_disabled": true,
+  "approved_odoo_models": [
+    "stock.location",
+    "stock.quant",
+    "stock.move.line"
+  ],
+  "data_classification_review_complete": false,
+  "approved_measurement_statuses": [
+    "FIELD_VERIFIED"
+  ],
+  "capacity_source_approved": false,
+  "product_physical_metadata_source_approved": false,
+  "material_handling_method_defined": false,
+  "reservation_control_procedure_defined": false,
+  "traceability_relocation_workflow_defined": false,
+  "flight_critical_policy_available": false,
+  "human_approval_owner": "",
+  "pilot_scope_owner": ""
+}
