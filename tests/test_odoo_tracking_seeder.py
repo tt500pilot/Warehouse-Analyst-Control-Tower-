@@ -1,6 +1,13 @@
 import pytest
 
-from scripts.seed_odoo_tracking import build_tracking_targets
+from scripts.seed_odoo_tracking import _m2o_id, build_tracking_targets
+
+
+def test_m2o_id_treats_odoo_false_as_missing():
+    assert _m2o_id(False) is None
+    assert _m2o_id([False, ""]) is None
+    assert _m2o_id(42) == 42
+    assert _m2o_id([42, "Record"]) == 42
 
 
 def test_build_tracking_targets_creates_one_lot_per_demand_location():
