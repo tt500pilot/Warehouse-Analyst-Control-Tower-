@@ -5,6 +5,7 @@ Examples:
   python scripts/kitting_instrumentation.py event --session-id <id> --type location_arrival --location-code A-01-L1-BA
   python scripts/kitting_instrumentation.py event --session-id <id> --type item_scan --product-code SEAL-218 --quantity 2
   python scripts/kitting_instrumentation.py stage --session-id <id>
+  python scripts/kitting_instrumentation.py retag --session-id <id> --route-algorithm-version virtual-picker-nearest-neighbor-v1
   python scripts/kitting_instrumentation.py close --session-id <id>
   python scripts/kitting_instrumentation.py report --session-id <id>
 """
@@ -73,6 +74,13 @@ def main() -> None:
     stage = sub.add_parser("stage")
     stage.add_argument("--session-id", required=True)
 
+    retag = sub.add_parser("retag")
+    retag.add_argument("--session-id", required=True)
+    retag.add_argument("--operator", default=None)
+    retag.add_argument("--layout-version", default=None)
+    retag.add_argument("--route-algorithm-version", default=None)
+    retag.add_argument("--notes", default=None)
+
     close = sub.add_parser("close")
     close.add_argument("--session-id", required=True)
     close.add_argument("--cancelled", action="store_true")
@@ -83,7 +91,7 @@ def main() -> None:
     active = sub.add_parser("active")
     active.add_argument("--picking-id", type=int, required=True)
 
-    summary = sub.add_parser("summary")
+    sub.add_parser("summary")
 
     args = parser.parse_args()
     store = KittingEventStore()
@@ -113,6 +121,14 @@ def main() -> None:
         )
     elif args.command == "stage":
         payload = store.append_event(args.session_id, "stage_complete")
+    elif args.command == "retag":
+        payload = store.update_session_metadata(
+            args.session_id,
+            operator=args.operator,
+            layout_version=args.layout_version,
+            route_algorithm_version=args.route_algorithm_version,
+            notes=args.notes,
+        )
     elif args.command == "close":
         payload = store.close_session(args.session_id, cancelled=args.cancelled)
     elif args.command == "report":
