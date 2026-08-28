@@ -1,55 +1,58 @@
-"""Convert AWIA sandbox tracked inventory into native Odoo lot/serial stock.
+"""Prepare native Odoo lot/serial stock for the active AWIA kitting workload.
 
-The original master-data sandbox intentionally proved inventory connectivity
-first.  This follow-on migration upgrades the tracked components needed by the
-AWIA manufacturing/kitting scenario so Odoo can reserve real lot/serial stock.
+The first AWIA sandbox seed intentionally proved basic inventory connectivity.
+It created on-hand quantities even for tracked products without lot/serial IDs.
+This follow-on migration upgrades only the quantity needed by the currently open
+AWIA Pick Components transfers.
+
+Why demand-scoped instead of serializing the whole sandbox?
+A full conversion would create thousands of serial records that are irrelevant
+to the current 12-kit workflow.  This script instead moves just the required
+quantity from anonymous tracked stock into deterministic lot/serial quants,
+lets Odoo rebuild the reservations, and restores the remaining anonymous stock.
+Total on-hand quantity is preserved.
 
 Workflow on --apply:
-1. Identify AWIA Pick Components transfers and the tracked products they use.
-2. Unreserve those open transfers by unlinking their reservation move lines.
-   Odoo's stock.move.line.unlink() natively frees the reserved quants.
-3. Create deterministic stock.lot records and lot-specific stock.quant inventory
-   using the fixture's target quantities and locations.
-4. Zero the old anonymous (lot_id=False) quants for those same product/location
-   targets so future reservation cannot silently fall back to untracked stock.
-5. Call stock.picking.action_assign() so Odoo rebuilds reservations from the
-   traced inventory.
+1. Identify the open AWIA Pick Components reservation lines that require
+   lot/serial tracking but currently have no lot_id.
+2. Snapshot anonymous on-hand stock by product + physical source location.
+3. Unlink only those missing-traceability reservation lines. Odoo natively
+   releases the corresponding reservations when stock.move.line is unlinked.
+4. Temporarily zero the relevant anonymous quants so Odoo cannot reserve them.
+5. Create deterministic lot/serial stock equal to the current kitting demand.
+6. Call stock.picking.action_assign() to rebuild reservations from traced stock.
+7. Restore the anonymous remainder so total warehouse on-hand is unchanged.
 
 Safety properties:
 - dry-run by default
 - same sandbox write guard as the other seeders
-- refuses to touch done/cancelled AWIA Pick Components transfers
-- deterministic lot/serial names and target quantities make reruns idempotent
-- never bypasses Odoo validation or directly updates PostgreSQL
+- refuses done/cancelled AWIA Pick Components transfers
+- mutates only tracked reservation lines that are missing lot/serial evidence
+- deterministic lot/serial names make interrupted reruns recoverable
+- never bypasses Odoo validation and never writes PostgreSQL directly
 """
 
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
+import re
 import sys
 from collections import defaultdict
-from pathlib import Path
 from typing import Any
+
+from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from odoo_client import OdooWarehouseClient
-from scripts.generate_simulation_sandbox import generate
 from scripts.seed_odoo_sandbox import assert_write_guard
 
-DEFAULT_DATA_DIR = ROOT_DIR / "data" / "simulation_sandbox"
 DEFAULT_ORIGIN_PREFIX = "AWIA-MOCK-MO-"
 LOT_PREFIX = "A"
-
-
-def _read_csv(path: Path) -> list[dict[str, str]]:
-    with path.open(newline="", encoding="utf-8") as handle:
-        return list(csv.DictReader(handle))
 
 
 def _m2o_id(value: Any) -> int | None:
@@ -68,6 +71,86 @@ def _m2o_label(value: Any) -> str | None:
     return None
 
 
+def _number(value: Any) -> float:
+    return float(value) if isinstance(value, (int, float)) else 0.0
+
+
+def _safe_token(value: str, *, max_len: int = 18) -> str:
+    token = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-") or "X"
+    return token[:max_len]
+
+
+def _integer_units(quantity: float, *, product_code: str) -> int:
+    rounded = round(quantity)
+    if not math.isclose(quantity, rounded, abs_tol=1e-9):
+        raise RuntimeError(
+            f"Serial-tracked product {product_code} has non-integer required quantity {quantity}."
+        )
+    if rounded < 0:
+        raise RuntimeError(
+            f"Serial-tracked product {product_code} has negative required quantity {quantity}."
+        )
+    return int(rounded)
+
+
+def _lot_name(product_code: str, location_id: int) -> str:
+    return f"{LOT_PREFIX}-{_safe_token(product_code)}-L{location_id}"
+
+
+def _serial_name(product_code: str, location_id: int, sequence: int) -> str:
+    return f"{LOT_PREFIX}-{_safe_token(product_code)}-{location_id}-S{sequence:04d}"
+
+
+def build_tracking_targets(
+    demands: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Expand product/location demand into deterministic lot/serial target rows."""
+    targets: list[dict[str, Any]] = []
+    ordered = sorted(
+        demands,
+        key=lambda row: (
+            str(row["product_code"]),
+            int(row["location_id"]),
+        ),
+    )
+    for row in ordered:
+        code = str(row["product_code"])
+        tracking = str(row["tracking"])
+        location_id = int(row["location_id"])
+        quantity = float(row["quantity"])
+        if quantity <= 0:
+            continue
+        if tracking == "lot":
+            targets.append(
+                {
+                    "product_id": int(row["product_id"]),
+                    "product_code": code,
+                    "tracking": tracking,
+                    "location_id": location_id,
+                    "location": row.get("location"),
+                    "lot_name": _lot_name(code, location_id),
+                    "quantity": quantity,
+                }
+            )
+            continue
+        if tracking != "serial":
+            continue
+        units = _integer_units(quantity, product_code=code)
+        for sequence in range(1, units + 1):
+            targets.append(
+                {
+                    "product_id": int(row["product_id"]),
+                    "product_code": code,
+                    "tracking": tracking,
+                    "location_id": location_id,
+                    "location": row.get("location"),
+                    "lot_name": _serial_name(code, location_id, sequence),
+                    "quantity": 1.0,
+                }
+            )
+    return targets
+
+
 def _search_one(
     client: OdooWarehouseClient,
     model: str,
@@ -80,83 +163,9 @@ def _search_one(
     return rows[0] if rows else None
 
 
-def _print_progress(label: str, current: int, total: int, *, apply: bool) -> None:
-    if apply and (current == 1 or current == total or current % 25 == 0):
+def _print_progress(label: str, current: int, total: int) -> None:
+    if current == 1 or current == total or current % 25 == 0:
         print(f"{label}: {current}/{total}", flush=True)
-
-
-def _integer_units(quantity: float, *, product_code: str) -> int:
-    rounded = round(quantity)
-    if not math.isclose(quantity, rounded, abs_tol=1e-9):
-        raise RuntimeError(
-            f"Serial-tracked product {product_code} has non-integer sandbox quantity {quantity}."
-        )
-    if rounded < 0:
-        raise RuntimeError(
-            f"Serial-tracked product {product_code} has negative sandbox quantity {quantity}."
-        )
-    return int(rounded)
-
-
-def _lot_name(product_code: str, location_sequence: int) -> str:
-    return f"{LOT_PREFIX}-{product_code}-L{location_sequence:02d}"
-
-
-def _serial_name(product_code: str, serial_sequence: int) -> str:
-    return f"{LOT_PREFIX}-{product_code}-S{serial_sequence:04d}"
-
-
-def build_tracking_targets(
-    fixture_quants: list[dict[str, str]],
-    *,
-    relevant_tracking_by_code: dict[str, str],
-) -> list[dict[str, Any]]:
-    """Expand fixture quants into deterministic desired lot/serial stock rows."""
-    rows_by_product: dict[str, list[dict[str, str]]] = defaultdict(list)
-    for row in fixture_quants:
-        code = row["product_code"]
-        if relevant_tracking_by_code.get(code) in {"lot", "serial"}:
-            rows_by_product[code].append(row)
-
-    targets: list[dict[str, Any]] = []
-    for code in sorted(rows_by_product):
-        tracking = relevant_tracking_by_code[code]
-        product_rows = sorted(rows_by_product[code], key=lambda row: row["location_code"])
-        serial_sequence = 0
-        for location_sequence, row in enumerate(product_rows, start=1):
-            quantity = float(row["quantity"])
-            if tracking == "lot":
-                targets.append(
-                    {
-                        "product_code": code,
-                        "tracking": tracking,
-                        "location_code": row["location_code"],
-                        "lot_name": _lot_name(code, location_sequence),
-                        "quantity": quantity,
-                    }
-                )
-                continue
-
-            units = _integer_units(quantity, product_code=code)
-            for _ in range(units):
-                serial_sequence += 1
-                targets.append(
-                    {
-                        "product_code": code,
-                        "tracking": tracking,
-                        "location_code": row["location_code"],
-                        "lot_name": _serial_name(code, serial_sequence),
-                        "quantity": 1.0,
-                    }
-                )
-    return targets
-
-
-def _load_location_barcodes(data_dir: Path) -> dict[str, str]:
-    return {
-        row["odoo_complete_name"]: row["barcode"]
-        for row in _read_csv(data_dir / "mock_warehouse" / "locations.csv")
-    }
 
 
 def _resolve_awia_kitting_scope(
@@ -222,21 +231,29 @@ def _resolve_awia_kitting_scope(
             if product_id is not None
         }
     )
-    product_fields = ["id", "default_code", "tracking"]
     products = client.search_read(
         "product.product",
         domain=[["id", "in", product_ids]],
-        fields=[field for field in product_fields if field in set(client.available_fields("product.product"))],
+        fields=["id", "default_code", "tracking"],
         limit=5000,
         order="id asc",
     )
-    tracking_by_code = {
-        str(row.get("default_code")): str(row.get("tracking") or "none")
+    product_by_id = {
+        int(row["id"]): row
         for row in products
-        if row.get("default_code") and row.get("tracking") in {"lot", "serial"}
+        if isinstance(row.get("id"), int)
     }
 
-    line_fields = ["id", "picking_id", "product_id", "quantity", "lot_id"]
+    line_fields = [
+        "id",
+        "move_id",
+        "picking_id",
+        "product_id",
+        "quantity",
+        "lot_id",
+        "location_id",
+        "state",
+    ]
     reservation_lines = client.search_read(
         "stock.move.line",
         domain=[["picking_id", "in", pbm_ids], ["state", "not in", ["done", "cancel"]]],
@@ -245,54 +262,58 @@ def _resolve_awia_kitting_scope(
         order="picking_id asc, id asc",
     )
 
+    missing_lines: list[dict[str, Any]] = []
+    for line in reservation_lines:
+        product_id = _m2o_id(line.get("product_id"))
+        product = product_by_id.get(product_id or -1)
+        tracking = str((product or {}).get("tracking") or "none")
+        if tracking not in {"lot", "serial"}:
+            continue
+        if _number(line.get("quantity")) <= 0:
+            continue
+        if _m2o_id(line.get("lot_id")) is not None:
+            continue
+        missing_lines.append(line)
+
     return {
         "manufacturing_orders": mos,
         "pickings": pbm_pickings,
         "picking_ids": pbm_ids,
         "moves": moves,
         "products": products,
-        "tracking_by_code": tracking_by_code,
+        "product_by_id": product_by_id,
         "reservation_lines": reservation_lines,
+        "missing_tracking_lines": missing_lines,
     }
 
 
-def _resolve_product_ids(client: OdooWarehouseClient, codes: set[str]) -> dict[str, int]:
-    rows = client.search_read(
-        "product.product",
-        domain=[["default_code", "in", sorted(codes)]],
-        fields=["id", "default_code"],
-        limit=max(100, len(codes) * 2),
-    )
-    return {
-        str(row["default_code"]): int(row["id"])
-        for row in rows
-        if isinstance(row.get("id"), int) and row.get("default_code")
-    }
+def _build_demands(scope: dict[str, Any]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[int, int], float] = defaultdict(float)
+    location_labels: dict[int, str | None] = {}
+    for line in scope["missing_tracking_lines"]:
+        product_id = _m2o_id(line.get("product_id"))
+        location_id = _m2o_id(line.get("location_id"))
+        if product_id is None or location_id is None:
+            raise RuntimeError("A tracked reservation line is missing product/location identity.")
+        grouped[(product_id, location_id)] += _number(line.get("quantity"))
+        location_labels[location_id] = _m2o_label(line.get("location_id"))
 
-
-def _resolve_location_ids(
-    client: OdooWarehouseClient,
-    location_codes: set[str],
-    *,
-    barcode_by_location_code: dict[str, str],
-) -> dict[str, int]:
-    result: dict[str, int] = {}
-    for code in sorted(location_codes):
-        barcode = barcode_by_location_code.get(code)
-        if not barcode:
-            raise RuntimeError(f"No deterministic warehouse barcode exists for fixture location {code}.")
-        location = _search_one(
-            client,
-            "stock.location",
-            [["barcode", "=", barcode]],
-            ["id", "barcode", "complete_name"],
+    demands: list[dict[str, Any]] = []
+    for (product_id, location_id), quantity in sorted(grouped.items()):
+        product = scope["product_by_id"].get(product_id)
+        if not product or not product.get("default_code"):
+            raise RuntimeError(f"Tracked product {product_id} is missing a stable default_code.")
+        demands.append(
+            {
+                "product_id": product_id,
+                "product_code": str(product["default_code"]),
+                "tracking": str(product.get("tracking") or "none"),
+                "location_id": location_id,
+                "location": location_labels.get(location_id),
+                "quantity": round(quantity, 6),
+            }
         )
-        if not location or not isinstance(location.get("id"), int):
-            raise RuntimeError(
-                f"Odoo location for fixture {code} / barcode {barcode} was not found."
-            )
-        result[code] = int(location["id"])
-    return result
+    return demands
 
 
 def _ensure_lot(
@@ -308,13 +329,37 @@ def _ensure_lot(
         ["id", "name", "product_id"],
     )
     if existing and isinstance(existing.get("id"), int):
-        return int(existing["id"]), "exists"
+        return int(existing["id"]), "existing"
     lot_id = client.execute_kw(
         "stock.lot",
         "create",
         args=[{"name": lot_name, "product_id": product_id}],
     )
     return int(lot_id), "created"
+
+
+def _read_quant_total(
+    client: OdooWarehouseClient,
+    *,
+    product_id: int,
+    location_id: int,
+    lot_name_prefix: str | None,
+) -> float:
+    domain: list[Any] = [
+        ["product_id", "=", product_id],
+        ["location_id", "=", location_id],
+    ]
+    if lot_name_prefix is None:
+        domain.append(["lot_id", "=", False])
+    else:
+        domain.extend([["lot_id", "!=", False], ["lot_id.name", "=ilike", f"{lot_name_prefix}%"]])
+    rows = client.search_read(
+        "stock.quant",
+        domain=domain,
+        fields=["id", "quantity", "reserved_quantity", "lot_id"],
+        limit=10000,
+    )
+    return round(sum(_number(row.get("quantity")) for row in rows), 6)
 
 
 def _set_quant_target(
@@ -328,8 +373,8 @@ def _set_quant_target(
     domain: list[Any] = [
         ["product_id", "=", product_id],
         ["location_id", "=", location_id],
+        ["lot_id", "=", lot_id if lot_id is not None else False],
     ]
-    domain.append(["lot_id", "=", lot_id if lot_id is not None else False])
     existing = _search_one(
         client,
         "stock.quant",
@@ -345,7 +390,6 @@ def _set_quant_target(
             kwargs={"context": context},
         )
         return "updated"
-
     values: dict[str, Any] = {
         "product_id": product_id,
         "location_id": location_id,
@@ -362,13 +406,22 @@ def _set_quant_target(
     return "created"
 
 
-def _reservation_lines_remaining(client: OdooWarehouseClient, picking_ids: list[int]) -> int:
+def _remaining_missing_tracking_lines(
+    client: OdooWarehouseClient,
+    *,
+    picking_ids: list[int],
+    tracked_product_ids: list[int],
+) -> int:
+    if not tracked_product_ids:
+        return 0
     rows = client.search_read(
         "stock.move.line",
         domain=[
             ["picking_id", "in", picking_ids],
+            ["product_id", "in", tracked_product_ids],
             ["state", "not in", ["done", "cancel"]],
             ["quantity", ">", 0],
+            ["lot_id", "=", False],
         ],
         fields=["id"],
         limit=10000,
@@ -378,139 +431,156 @@ def _reservation_lines_remaining(client: OdooWarehouseClient, picking_ids: list[
 
 def migrate_tracking(
     *,
-    data_dir: Path = DEFAULT_DATA_DIR,
     origin_prefix: str = DEFAULT_ORIGIN_PREFIX,
     apply: bool = False,
 ) -> dict[str, Any]:
-    if not (data_dir / "manifest.json").exists():
-        generate(data_dir)
-
     client = OdooWarehouseClient.from_env()
     assert_write_guard(client.database, apply=apply)
     scope = _resolve_awia_kitting_scope(client, origin_prefix=origin_prefix)
+    demands = _build_demands(scope)
+    targets = build_tracking_targets(demands)
 
-    fixture_quants = _read_csv(data_dir / "mock_odoo" / "quants.csv")
-    targets = build_tracking_targets(
-        fixture_quants,
-        relevant_tracking_by_code=scope["tracking_by_code"],
-    )
-    codes = {row["product_code"] for row in targets}
-    location_codes = {row["location_code"] for row in targets}
-    barcode_by_location_code = _load_location_barcodes(data_dir)
-
-    product_ids = _resolve_product_ids(client, codes)
-    location_ids = _resolve_location_ids(
-        client,
-        location_codes,
-        barcode_by_location_code=barcode_by_location_code,
-    )
-
-    fixture_quant_pairs = sorted(
-        {
-            (row["product_code"], row["location_code"])
-            for row in fixture_quants
-            if row["product_code"] in codes
-        }
-    )
     lot_targets = [row for row in targets if row["tracking"] == "lot"]
     serial_targets = [row for row in targets if row["tracking"] == "serial"]
+    tracked_product_ids = sorted({int(row["product_id"]) for row in demands})
+
+    pair_snapshots: dict[tuple[int, int], dict[str, Any]] = {}
+    for demand in demands:
+        product_id = int(demand["product_id"])
+        location_id = int(demand["location_id"])
+        prefix = f"{LOT_PREFIX}-{_safe_token(str(demand['product_code']))}-"
+        anonymous = _read_quant_total(
+            client,
+            product_id=product_id,
+            location_id=location_id,
+            lot_name_prefix=None,
+        )
+        deterministic_traced = _read_quant_total(
+            client,
+            product_id=product_id,
+            location_id=location_id,
+            lot_name_prefix=prefix,
+        )
+        total_managed = round(anonymous + deterministic_traced, 6)
+        required = float(demand["quantity"])
+        if total_managed + 1e-6 < required:
+            raise RuntimeError(
+                f"Insufficient managed stock for {demand['product_code']} at {demand.get('location') or location_id}: "
+                f"required={required}, available={total_managed}."
+            )
+        pair_snapshots[(product_id, location_id)] = {
+            **demand,
+            "anonymous_before": anonymous,
+            "deterministic_traced_before": deterministic_traced,
+            "total_managed_before": total_managed,
+            "anonymous_remainder": round(total_managed - required, 6),
+        }
+
     summary: dict[str, Any] = {
         "database": client.database,
         "mode": "apply" if apply else "dry_run",
         "awia_pick_component_transfers": len(scope["pickings"]),
-        "reservation_lines_to_rebuild": len(scope["reservation_lines"]),
-        "tracked_products": len(codes),
-        "lot_tracked_products": len({row["product_code"] for row in lot_targets}),
-        "serial_tracked_products": len({row["product_code"] for row in serial_targets}),
+        "reservation_lines_total": len(scope["reservation_lines"]),
+        "missing_tracking_lines_to_rebuild": len(scope["missing_tracking_lines"]),
+        "tracked_products_in_scope": len(tracked_product_ids),
+        "product_location_demands": len(demands),
+        "required_traced_quantity": round(sum(float(row["quantity"]) for row in demands), 6),
+        "lot_tracked_products": len({row["product_id"] for row in lot_targets}),
+        "serial_tracked_products": len({row["product_id"] for row in serial_targets}),
         "target_lot_records": len(lot_targets),
         "target_serial_records": len(serial_targets),
         "target_traced_quants": len(targets),
-        "anonymous_quant_targets_to_zero": len(fixture_quant_pairs),
+        "full_sandbox_serialization_avoided": True,
         "lots": {"created": 0, "existing": 0},
         "traced_quants": {"created": 0, "updated": 0},
         "anonymous_quants": {"created": 0, "updated": 0},
         "reassigned": False,
-        "reservation_lines_after_reassign": None,
+        "missing_tracking_lines_after_reassign": None,
     }
+    if not demands:
+        summary["note"] = "All open tracked AWIA reservation lines already have lot/serial evidence."
+        return summary
     if not apply:
         return summary
 
-    reservation_ids = [
+    missing_line_ids = [
         int(row["id"])
-        for row in scope["reservation_lines"]
+        for row in scope["missing_tracking_lines"]
         if isinstance(row.get("id"), int)
     ]
-    if reservation_ids:
-        client.execute_kw("stock.move.line", "unlink", args=[reservation_ids])
-    remaining = _reservation_lines_remaining(client, scope["picking_ids"])
-    if remaining:
-        raise RuntimeError(
-            f"Refusing inventory migration because {remaining} open reserved move line(s) remain after unreserve."
-        )
-    print(f"Reservations released: {len(reservation_ids)}", flush=True)
+    client.execute_kw("stock.move.line", "unlink", args=[missing_line_ids])
+    print(f"Anonymous tracked reservations released: {len(missing_line_ids)}", flush=True)
 
-    lot_ids_by_key: dict[tuple[str, str], int] = {}
-    for index, target in enumerate(targets, start=1):
-        code = target["product_code"]
-        product_id = product_ids.get(code)
-        location_id = location_ids.get(target["location_code"])
-        if not product_id or not location_id:
-            raise RuntimeError(f"Could not resolve product/location for tracking target {target}.")
-        lot_id, lot_action = _ensure_lot(
-            client,
-            product_id=product_id,
-            lot_name=target["lot_name"],
-        )
-        summary["lots"][lot_action] += 1
-        lot_ids_by_key[(code, target["lot_name"])] = lot_id
-        quant_action = _set_quant_target(
-            client,
-            product_id=product_id,
-            location_id=location_id,
-            lot_id=lot_id,
-            quantity=float(target["quantity"]),
-        )
-        summary["traced_quants"][quant_action] += 1
-        _print_progress("Traced inventory", index, len(targets), apply=True)
-
-    for index, (code, location_code) in enumerate(fixture_quant_pairs, start=1):
-        product_id = product_ids.get(code)
-        location_id = location_ids.get(location_code)
-        if not product_id or not location_id:
-            raise RuntimeError(
-                f"Could not resolve anonymous quant target for {code} at {location_code}."
-            )
+    for index, snapshot in enumerate(pair_snapshots.values(), start=1):
         action = _set_quant_target(
             client,
-            product_id=product_id,
-            location_id=location_id,
+            product_id=int(snapshot["product_id"]),
+            location_id=int(snapshot["location_id"]),
             lot_id=None,
             quantity=0.0,
         )
         summary["anonymous_quants"][action] += 1
-        _print_progress("Anonymous inventory cleanup", index, len(fixture_quant_pairs), apply=True)
+        _print_progress("Anonymous inventory isolated", index, len(pair_snapshots))
 
-    client.execute_kw("stock.picking", "action_assign", args=[scope["picking_ids"]])
+    targets_by_pair: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+    for target in targets:
+        targets_by_pair[(int(target["product_id"]), int(target["location_id"]))].append(target)
+
+    for index, target in enumerate(targets, start=1):
+        lot_id, lot_action = _ensure_lot(
+            client,
+            product_id=int(target["product_id"]),
+            lot_name=str(target["lot_name"]),
+        )
+        summary["lots"][lot_action] += 1
+        quant_action = _set_quant_target(
+            client,
+            product_id=int(target["product_id"]),
+            location_id=int(target["location_id"]),
+            lot_id=lot_id,
+            quantity=float(target["quantity"]),
+        )
+        summary["traced_quants"][quant_action] += 1
+        _print_progress("Traced inventory", index, len(targets))
+
+    affected_picking_ids = sorted(
+        {
+            picking_id
+            for row in scope["missing_tracking_lines"]
+            for picking_id in [_m2o_id(row.get("picking_id"))]
+            if picking_id is not None
+        }
+    )
+    client.execute_kw("stock.picking", "action_assign", args=[affected_picking_ids])
     summary["reassigned"] = True
-    summary["reservation_lines_after_reassign"] = _reservation_lines_remaining(
-        client, scope["picking_ids"]
+
+    for index, snapshot in enumerate(pair_snapshots.values(), start=1):
+        action = _set_quant_target(
+            client,
+            product_id=int(snapshot["product_id"]),
+            location_id=int(snapshot["location_id"]),
+            lot_id=None,
+            quantity=float(snapshot["anonymous_remainder"]),
+        )
+        summary["anonymous_quants"][action] += 1
+        _print_progress("Anonymous inventory restored", index, len(pair_snapshots))
+
+    summary["missing_tracking_lines_after_reassign"] = _remaining_missing_tracking_lines(
+        client,
+        picking_ids=scope["picking_ids"],
+        tracked_product_ids=tracked_product_ids,
     )
     return summary
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Migrate AWIA tracked component inventory to native Odoo lots/serials."
+        description="Prepare demand-scoped lot/serial stock for AWIA Pick Components transfers."
     )
-    parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
     parser.add_argument("--origin-prefix", default=DEFAULT_ORIGIN_PREFIX)
     parser.add_argument("--apply", action="store_true", help="Write to Odoo. Default is dry-run.")
     args = parser.parse_args()
-    result = migrate_tracking(
-        data_dir=Path(args.data_dir),
-        origin_prefix=args.origin_prefix,
-        apply=args.apply,
-    )
+    result = migrate_tracking(origin_prefix=args.origin_prefix, apply=args.apply)
     print(json.dumps(result, indent=2))
 
 
