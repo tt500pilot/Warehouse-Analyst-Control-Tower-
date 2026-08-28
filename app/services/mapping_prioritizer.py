@@ -1,15 +1,16 @@
 """Odoo-only warehouse mapping prioritization for AWIA.
 
-This module answers a deployment question that comes *before* XYZ mapping:
+This module answers a deployment question that comes before XYZ mapping:
 which logical storage area is most worth mapping first?
 
 It deliberately does not estimate walking distance or labor savings. Without a
 validated physical geometry/path graph, Odoo can support relative opportunity
-signals only: movement activity, velocity concentration, reservations,
-traceability/criticality, BOM relevance, and inventory dispersion.
+signals only: operational movement activity, velocity concentration,
+reservations, traceability/criticality, BOM relevance, and inventory dispersion.
 
-The result is advisory/read-only and is intended to choose the smallest useful
-physical mapping scope for a later XYZ + legal-path-graph pilot.
+Inventory-adjustment moves are reported separately and excluded from physical
+movement scoring because they can represent bookkeeping, inventory-mode seeding,
+or count corrections rather than picker/cart travel.
 """
 
 from __future__ import annotations
@@ -95,28 +96,24 @@ def _path_parts(location_name: str) -> list[str]:
 
 
 def _is_candidate_storage_location(location: Record) -> bool:
-    """Return True only for internal descendants of an Odoo Stock location.
-
-    Operational locations such as Pre-Production, Production, staging, and
-    virtual Inventory Adjustment can have quants/reservations but are flow
-    endpoints, not storage areas to rank for physical bin mapping.
-    """
     usage = str(location.get("usage") or "internal").lower()
     if usage != "internal":
         return False
-    parts = _path_parts(_location_name(location))
-    return any(part.lower() == "stock" for part in parts)
+    return any(part.lower() == "stock" for part in _path_parts(_location_name(location)))
+
+
+def _is_inventory_adjustment_location(value: Any, location_by_id: Mapping[int, Record]) -> bool:
+    location_id = _m2o_id(value)
+    location = location_by_id.get(location_id or -1, {})
+    usage = str(location.get("usage") or "").lower()
+    if usage == "inventory":
+        return True
+    name = (_location_name(location) or _m2o_name(value)).strip().lower()
+    return "inventory adjustment" in name or "inventory adjustments" in name
 
 
 def derive_logical_area(location_name: str) -> tuple[str, str]:
-    """Derive a stable pre-geometry mapping area from an Odoo location name.
-
-    Preferred strategy is a meaningful hierarchy segment below ``Stock``. For a
-    flat ``WH/Stock/A-01`` layout, an aisle-like alpha prefix is used. The AWIA
-    sandbox has a neutral ``AWIA Mock`` container below Stock, so the aisle is
-    derived one level deeper rather than collapsing every bin into one area.
-    This remains logical grouping only; it is not physical geometry.
-    """
+    """Derive a stable pre-geometry mapping area from an Odoo location name."""
     parts = _path_parts(location_name)
     if not parts:
         return "UNMAPPED", "unmapped"
@@ -186,7 +183,7 @@ def _relative(values: Mapping[str, float]) -> dict[str, float]:
 
 def _top_reasons(components: Mapping[str, float], metrics: Mapping[str, Any]) -> list[str]:
     labels = {
-        "activity": "high recent stock-move activity",
+        "activity": "high recent operational stock-move activity",
         "velocity": "concentration of high-velocity SKUs/touches",
         "production": "strong BOM/component relevance",
         "criticality": "flight-critical inventory/activity concentration",
@@ -197,7 +194,7 @@ def _top_reasons(components: Mapping[str, float], metrics: Mapping[str, Any]) ->
     ordered = sorted(components, key=lambda key: (-components[key], key))
     reasons = [labels[key] for key in ordered if components[key] > 0][:3]
     if metrics.get("move_touches"):
-        reasons.append(f"{int(metrics['move_touches'])} storage touches in the analysis window")
+        reasons.append(f"{int(metrics['move_touches'])} operational storage touches in the analysis window")
     if metrics.get("high_velocity_skus"):
         reasons.append(f"{int(metrics['high_velocity_skus'])} high-velocity SKUs currently stored here")
     return reasons[:5]
@@ -236,9 +233,6 @@ def analyze_mapping_priorities(
         if location_id is not None:
             location_by_id[location_id] = location
 
-    # Candidate mapping storage must be a real internal location beneath Stock.
-    # Quants in Pre-Production/Production/staging or virtual adjustment locations
-    # remain useful as flow counterparts but cannot become ranked storage areas.
     eligible_storage_location_ids = {
         location_id
         for location_id, location in location_by_id.items()
@@ -257,12 +251,9 @@ def analyze_mapping_priorities(
 
     area_by_location: dict[int, str] = {}
     grouping_strategy_by_area: dict[str, set[str]] = defaultdict(set)
-    location_name_by_id: dict[int, str] = {}
     for location_id in storage_location_ids:
         location = location_by_id[location_id]
-        name = _location_name(location)
-        location_name_by_id[location_id] = name
-        area, strategy = derive_logical_area(name)
+        area, strategy = derive_logical_area(_location_name(location))
         area_by_location[location_id] = area
         grouping_strategy_by_area[area].add(strategy)
 
@@ -292,6 +283,9 @@ def analyze_mapping_priorities(
     area_move_qty: dict[str, float] = defaultdict(float)
     area_product_touches: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     area_counterparts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    area_adjustment_touches: dict[str, int] = defaultdict(int)
+    inventory_adjustment_move_lines_excluded = 0
+    operational_move_lines_used = 0
 
     for move in moves_list:
         move_date = _parse_datetime(move.get("date") or move.get("write_date"))
@@ -300,18 +294,28 @@ def analyze_mapping_priorities(
         age_days = (now - move_date).total_seconds() / 86400.0
         if age_days < 0 or age_days >= lookback_days:
             continue
+
         product_id = _m2o_id(move.get("product_id"))
         if product_id is None:
             continue
 
-        source_id = _m2o_id(move.get("location_id"))
-        dest_id = _m2o_id(move.get("location_dest_id"))
+        source_value = move.get("location_id")
+        dest_value = move.get("location_dest_id")
+        source_id = _m2o_id(source_value)
+        dest_id = _m2o_id(dest_value)
         source_area = area_by_location.get(source_id or -1)
         dest_area = area_by_location.get(dest_id or -1)
         touched_areas = {area for area in (source_area, dest_area) if area}
         if not touched_areas:
             continue
 
+        if _is_inventory_adjustment_location(source_value, location_by_id) or _is_inventory_adjustment_location(dest_value, location_by_id):
+            inventory_adjustment_move_lines_excluded += 1
+            for area in touched_areas:
+                area_adjustment_touches[area] += 1
+            continue
+
+        operational_move_lines_used += 1
         product_touches[product_id] += 1
         quantity = abs(_number(move.get("quantity")) or _number(move.get("qty_done")))
         for area in touched_areas:
@@ -321,9 +325,9 @@ def analyze_mapping_priorities(
 
             counterpart_name = ""
             if area == source_area and dest_id is not None:
-                counterpart_name = _location_name(location_by_id.get(dest_id, {})) or _m2o_name(move.get("location_dest_id"))
+                counterpart_name = _location_name(location_by_id.get(dest_id, {})) or _m2o_name(dest_value)
             elif area == dest_area and source_id is not None:
-                counterpart_name = _location_name(location_by_id.get(source_id, {})) or _m2o_name(move.get("location_id"))
+                counterpart_name = _location_name(location_by_id.get(source_id, {})) or _m2o_name(source_value)
             if counterpart_name:
                 area_counterparts[area][counterpart_name] += 1
 
@@ -384,6 +388,7 @@ def analyze_mapping_priorities(
             "inventory_value": round(inventory_value, 2),
             "move_touches": area_touches.get(area, 0),
             "move_quantity": round(area_move_qty.get(area, 0.0), 3),
+            "inventory_adjustment_touches_excluded": area_adjustment_touches.get(area, 0),
             "high_velocity_skus": high_velocity_skus,
             "high_velocity_touches": high_velocity_touches,
             "flight_critical_skus": critical_skus,
@@ -467,7 +472,7 @@ def analyze_mapping_priorities(
                 "all active storage bins in the selected logical area",
                 "aisle centerlines and cross-aisles serving those bins",
                 "legal pedestrian/cart paths from the area",
-                *[f"connection to frequent flow point: {name}" for name in counterparts],
+                *[f"connection to frequent operational flow point: {name}" for name in counterparts],
             ],
             "do_not_claim_yet": [
                 "physical walking distance",
@@ -475,7 +480,7 @@ def analyze_mapping_priorities(
                 "optimal XYZ position",
                 "labor ROI from a relocation",
             ],
-            "next_measurement": "capture XYZ coordinates and legal-path graph only for this scoped area plus its key flow connections",
+            "next_measurement": "capture XYZ coordinates and legal-path graph only for this scoped area plus its key operational flow connections",
         }
 
     available_flight_field = any("x_is_flight_critical" in product for product in products_list)
@@ -487,7 +492,8 @@ def analyze_mapping_priorities(
         "methodology": {
             "purpose": "rank where physical warehouse mapping is most likely to be useful before XYZ/path data exists",
             "area_grouping": "rank only internal Stock descendants; prefer meaningful hierarchy below Stock and fall back to aisle-like prefixes",
-            "velocity": "relative stock-move touch rank among active products; top 20% HIGH, next 30% MEDIUM, remainder LOW",
+            "velocity": "relative operational stock-move touch rank among active products; top 20% HIGH, next 30% MEDIUM, remainder LOW",
+            "inventory_adjustments": "reported separately and excluded from physical movement/velocity scoring",
             "score": "relative 0-100 opportunity index across areas, not a savings estimate",
             "weights": weights,
             "physical_distance": "not used because validated XYZ/legal-path geometry is intentionally absent at this stage",
@@ -505,6 +511,8 @@ def analyze_mapping_priorities(
             "quant_locations_excluded_from_storage_ranking": len(excluded_quant_location_ids),
             "products_seen": len(products_by_id),
             "move_lines_seen": len(moves_list),
+            "operational_move_lines_used": operational_move_lines_used,
+            "inventory_adjustment_move_lines_excluded": inventory_adjustment_move_lines_excluded,
             "bom_lines_seen": len(bom_lines_list),
             "recommended_first_area": primary["logical_area"] if primary else None,
         },
