@@ -41,6 +41,19 @@ LOCATION_COLUMNS = [
     "notes",
 ]
 
+NODE_COLUMNS = [
+    "graph_node_id",
+    "node_type",
+    "serves_location",
+    "x",
+    "y",
+    "z",
+    "measurement_status",
+    "accessible_by",
+    "access_restriction",
+    "notes",
+]
+
 EDGE_COLUMNS = [
     "from_graph_node_id",
     "to_graph_node_id",
@@ -69,15 +82,6 @@ def _m2o_id(value: Any) -> int | None:
     return None
 
 
-def _m2o_name(value: Any) -> str:
-    if isinstance(value, (list, tuple)):
-        if len(value) > 1 and value[1] not in (None, False):
-            return str(value[1])
-        if value:
-            return str(value[0])
-    return "" if value in (None, False) else str(value)
-
-
 def _number(value: Any) -> float:
     if value in (None, False, ""):
         return 0.0
@@ -97,6 +101,13 @@ def _location_name(row: dict[str, Any]) -> str:
 def _slug(value: str) -> str:
     text = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-").lower()
     return text or "mapping-scope"
+
+
+def _node_id(record_type: str, location: dict[str, Any]) -> str:
+    location_id = _m2o_id(location.get("id"))
+    if location_id is not None:
+        return f"NODE_{record_type.upper()}_{location_id}"
+    return f"NODE_{record_type.upper()}_{_slug(_location_name(location)).upper().replace('-', '_')}"
 
 
 def _write_csv(path: Path, columns: list[str], rows: list[dict[str, Any]]) -> None:
@@ -148,7 +159,7 @@ def _location_row(
         "x": "",
         "y": "",
         "z": "",
-        "graph_node_id": "",
+        "graph_node_id": _node_id(record_type, location),
         "measurement_status": "NOT_MEASURED",
         "accessible_by": "",
         "one_way_or_access_notes": "",
@@ -157,6 +168,22 @@ def _location_row(
         "capacity_units": "",
         "capacity_weight_lb": "",
         "notes": "",
+    }
+
+
+def _graph_node_row(location_row: dict[str, Any]) -> dict[str, Any]:
+    record_type = str(location_row["record_type"])
+    return {
+        "graph_node_id": location_row["graph_node_id"],
+        "node_type": "pick_access" if record_type == "storage_bin" else "flow_endpoint",
+        "serves_location": location_row["complete_name"],
+        "x": "",
+        "y": "",
+        "z": "",
+        "measurement_status": "NOT_MEASURED",
+        "accessible_by": "",
+        "access_restriction": "",
+        "notes": "Add cross-aisle/turn/gate nodes as new rows when required by the real travel path.",
     }
 
 
@@ -246,8 +273,6 @@ def main() -> None:
         limit=args.source_limit,
         order="date asc, id asc",
     )
-    # All internal locations are intentionally fetched, including empty bins.
-    # Empty candidate locations are necessary for subsequent slotting analysis.
     locations = client.search_read(
         "stock.location",
         domain=[["usage", "=", "internal"]],
@@ -305,16 +330,8 @@ def main() -> None:
         if exact:
             flow_locations.extend(exact)
         else:
-            # Preserve unresolved endpoints in the package so the mapper knows a
-            # physical point still needs to be identified even if the fetched
-            # Odoo internal-location subset cannot resolve it.
             flow_locations.append(
-                {
-                    "id": "",
-                    "complete_name": name,
-                    "usage": "",
-                    "barcode": "",
-                }
+                {"id": "", "complete_name": name, "usage": "", "barcode": ""}
             )
 
     rows = [
@@ -325,14 +342,17 @@ def main() -> None:
         _location_row(location, record_type="flow_endpoint", logical_area="FLOW_ENDPOINT", totals=totals)
         for location in flow_locations
     )
+    node_rows = [_graph_node_row(row) for row in rows]
 
     slug = _slug(selected_area)
     output_dir = Path(args.output_dir)
     locations_path = output_dir / f"{slug}-locations.csv"
+    nodes_path = output_dir / f"{slug}-graph-nodes.csv"
     edges_path = output_dir / f"{slug}-path-edges.csv"
     manifest_path = output_dir / f"{slug}-manifest.json"
 
     _write_csv(locations_path, LOCATION_COLUMNS, rows)
+    _write_csv(nodes_path, NODE_COLUMNS, node_rows)
     _write_csv(edges_path, EDGE_COLUMNS, [])
 
     active_bins = sum(1 for row in rows if row["record_type"] == "storage_bin" and row["currently_holds_stock"])
@@ -352,23 +372,32 @@ def main() -> None:
             "currently_stocked_bins": active_bins,
             "currently_empty_bins": empty_bins,
             "flow_endpoints": len(flow_locations),
+            "initial_graph_nodes": len(node_rows),
         },
         "files": {
             "locations_csv": str(locations_path),
+            "graph_nodes_csv": str(nodes_path),
             "path_edges_csv": str(edges_path),
         },
         "measurement_instructions": [
             "Choose and document one permanent site datum at (0,0,0).",
-            "Enter XYZ for every storage-bin row, including empty bins.",
-            "Enter XYZ for each operational flow endpoint such as Pre-Production/Kitting.",
-            "Assign graph_node_id values at aisle centerlines, cross-aisles, turns, gates, and endpoints.",
-            "Populate path-edges.csv only with legal pedestrian/cart paths; do not use straight-line shortcuts through racks or barriers.",
+            "In locations.csv, enter XYZ for every storage bin and operational endpoint, including empty bins.",
+            "In graph-nodes.csv, measure the legal travel access point for every bin/endpoint; these coordinates may differ from the physical bin XYZ.",
+            "Add graph-node rows for cross-aisles, turns, gates, barriers, elevators/lifts, or other path-control points required by the real layout.",
+            "Populate path-edges.csv only with legal pedestrian/cart segments between graph nodes; do not use straight-line shortcuts through racks or barriers.",
             "Record access restrictions, one-way travel, secure-zone status, and real bin capacity/load rating before optimization.",
         ],
+        "geometry_model": {
+            "location_xyz": "physical bin/endpoint position",
+            "graph_node_xyz": "legal travel access point used for route distance",
+            "path_edges": "legal traversable segments joining graph nodes",
+            "important": "bin XYZ and graph-node XYZ are intentionally separate concepts",
+        },
         "guardrails": {
             "xyz_not_inferred_from_odoo": True,
             "empty_bins_included_for_candidate_slotting": True,
             "inventory_adjustment_moves_excluded_from_physical_priority_score": True,
+            "travel_topology_not_inferred_from_location_names": True,
             "no_odoo_writes": True,
             "human_review_required_before_geometry_is_accepted": True,
         },
