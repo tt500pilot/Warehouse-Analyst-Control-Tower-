@@ -2,8 +2,8 @@
 
 The simulator reads the live native Odoo reservation lines for one execution-ready
 Pick Components transfer, plans a route through mock-v1 geometry, and records
-synthetic observational events into the AWIA instrumentation sidecar.  It does
-not validate the Odoo transfer.  Odoo execution remains a separate explicit step.
+synthetic observational events into the AWIA instrumentation sidecar. It does
+not validate the Odoo transfer. Odoo execution remains a separate explicit step.
 
 All generated observations are classified as simulated_human_like, not actual
 human measurements.
@@ -28,6 +28,7 @@ from app.services.virtual_picker import (
     build_virtual_picker_plan,
     enrich_reservation_lines,
     load_geometry,
+    load_simulation_product_metadata,
 )
 from odoo_client import OdooWarehouseClient
 from scripts.check_kitting_execution_readiness import build_readiness_report
@@ -95,7 +96,12 @@ def _fetch_reservations(
             value[0] if isinstance(value, (list, tuple)) else value
             for line in lines
             for value in [line.get("product_id")]
-            if isinstance(value, int) or (isinstance(value, (list, tuple)) and value and isinstance(value[0], int))
+            if isinstance(value, int)
+            or (
+                isinstance(value, (list, tuple))
+                and value
+                and isinstance(value[0], int)
+            )
         }
     )
     product_fields = (
@@ -149,7 +155,13 @@ def simulate_picker(
 
     lines, product_by_id = _fetch_reservations(client, picking_id=picking_id)
     geometry = load_geometry(data_dir)
-    reservations = enrich_reservation_lines(lines, product_by_id, geometry)
+    simulation_product_by_code = load_simulation_product_metadata(data_dir)
+    reservations = enrich_reservation_lines(
+        lines,
+        product_by_id,
+        geometry,
+        simulation_product_by_code=simulation_product_by_code,
+    )
     plan = build_virtual_picker_plan(
         reservations,
         geometry,
@@ -162,6 +174,7 @@ def simulate_picker(
         "database": client.database,
         "mode": "apply_events" if apply_events else "dry_run",
         "classification": "simulated_human_like",
+        "criticality_source": "simulation_fixture_by_default_code",
         "session_id": session["session_id"],
         "picking": candidate,
         "plan": plan,
@@ -222,6 +235,7 @@ def simulate_picker(
                 "tracking": stop.get("tracking"),
                 "lot": stop.get("lot"),
                 "flight_critical": stop.get("flight_critical"),
+                "criticality_source": stop.get("criticality_source"),
                 "scan_seconds": stop["scan_seconds"],
             },
         )
