@@ -189,6 +189,10 @@ def simulate_picker(
     if not apply_events:
         return result
 
+    session = store.update_session_metadata(
+        str(session["session_id"]),
+        route_algorithm_version=str(plan["simulator_version"]),
+    )
     started_at = _parse_iso(str(session["started_at"]))
     metadata_base = {
         "classification": "simulated_human_like",
