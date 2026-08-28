@@ -147,3 +147,60 @@ def test_non_stock_quant_location_is_flow_endpoint_not_ranked_storage() -> None:
     assert result["areas"][0]["top_flow_counterparts"] == [
         {"location": "WH/Pre-Production", "touches": 1}
     ]
+
+
+def test_inventory_adjustment_move_is_reported_but_not_scored_as_operational_touch() -> None:
+    products = [
+        {
+            "id": 1,
+            "default_code": "P-1",
+            "name": "Part",
+            "standard_price": 100.0,
+            "tracking": "lot",
+            "x_is_flight_critical": False,
+        }
+    ]
+    locations = [
+        {"id": 101, "complete_name": "WH/Stock/AWIA Mock/H-01-L1-BA", "usage": "internal"},
+        {"id": 201, "complete_name": "WH/Pre-Production", "usage": "internal"},
+        {"id": 301, "complete_name": "Inventory adjustment", "usage": "inventory"},
+    ]
+    quants = [
+        {"id": 1, "product_id": [1, "Part"], "location_id": [101, "WH/Stock/AWIA Mock/H-01-L1-BA"], "quantity": 20.0, "reserved_quantity": 0.0}
+    ]
+    moves = [
+        {
+            "id": 1,
+            "product_id": [1, "Part"],
+            "location_id": [101, "WH/Stock/AWIA Mock/H-01-L1-BA"],
+            "location_dest_id": [201, "WH/Pre-Production"],
+            "quantity": 1.0,
+            "date": (NOW - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"),
+        },
+        {
+            "id": 2,
+            "product_id": [1, "Part"],
+            "location_id": [301, "Inventory adjustment"],
+            "location_dest_id": [101, "WH/Stock/AWIA Mock/H-01-L1-BA"],
+            "quantity": 20.0,
+            "date": (NOW - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S"),
+        },
+    ]
+
+    result = analyze_mapping_priorities(
+        products,
+        quants,
+        moves,
+        locations,
+        as_of=NOW,
+        lookback_days=90,
+    )
+
+    aisle = result["areas"][0]
+    assert aisle["move_touches"] == 1
+    assert aisle["inventory_adjustment_touches_excluded"] == 1
+    assert aisle["top_flow_counterparts"] == [
+        {"location": "WH/Pre-Production", "touches": 1}
+    ]
+    assert result["summary"]["operational_move_lines_used"] == 1
+    assert result["summary"]["inventory_adjustment_move_lines_excluded"] == 1
