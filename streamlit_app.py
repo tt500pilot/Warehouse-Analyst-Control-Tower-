@@ -10,6 +10,7 @@ import streamlit as st
 
 from app.ui.api_client import ControlTowerAPIError, get_json
 from app.ui.dataframe import make_frame
+from app.ui.optimization_artifacts import discover_analysis_areas, load_analysis_artifacts
 
 
 st.set_page_config(
@@ -20,6 +21,7 @@ st.set_page_config(
 )
 
 DEFAULT_API_URL = os.getenv("AWIA_API_URL", "http://127.0.0.1:8000")
+DEFAULT_ANALYSIS_DIR = os.getenv("AWIA_ANALYSIS_DIR", "data/analysis")
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -41,6 +43,19 @@ def money(value: Any) -> str:
         return f"${float(value):,.0f}"
     except (TypeError, ValueError):
         return "$0"
+
+
+def number(value: Any, digits: int = 1) -> str:
+    try:
+        return f"{float(value):,.{digits}f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def usable_artifact(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("artifact_error"):
+        return {}
+    return value
 
 
 def show_connection_banner(base_url: str) -> None:
@@ -209,6 +224,162 @@ def render_cycle_count_plan(base_url: str, source_limit: int) -> None:
     st.dataframe(frame[columns] if columns else frame, width="stretch", hide_index=True)
 
 
+def render_warehouse_optimization(base_url: str, source_limit: int) -> None:
+    st.subheader("Warehouse Optimization & Production Pilot")
+    st.caption(
+        "Manager view of mapping priority, modeled slotting evidence, pilot decisions, and the production-readiness boundary. "
+        "AWIA remains advisory and this page performs no Odoo writes."
+    )
+
+    areas = discover_analysis_areas(DEFAULT_ANALYSIS_DIR)
+    if not areas:
+        st.warning(
+            f"No production-readiness artifacts were found in {DEFAULT_ANALYSIS_DIR}. "
+            "Run a mapped-area decision pipeline and production-pilot readiness evaluation first."
+        )
+        return
+
+    selected_area = st.selectbox("Mapped analysis area", areas, index=len(areas) - 1)
+    bundle = load_analysis_artifacts(selected_area, DEFAULT_ANALYSIS_DIR)
+    artifacts = bundle.get("artifacts", {})
+
+    readiness = usable_artifact(artifacts.get("production_pilot_readiness"))
+    intake = usable_artifact(artifacts.get("production_pilot_intake"))
+    decision_report = usable_artifact(artifacts.get("decision_report"))
+    pilot_decision = usable_artifact(artifacts.get("pilot_decision"))
+    package_decision = usable_artifact(artifacts.get("copick_package_pilot_decision"))
+    package_economics = usable_artifact(artifacts.get("copick_package_economics"))
+    slotting = usable_artifact(artifacts.get("slotting"))
+    route = usable_artifact(artifacts.get("route_validation"))
+
+    if bundle.get("missing_artifacts"):
+        st.info("Some optional analysis artifacts are not present: " + ", ".join(bundle["missing_artifacts"]))
+
+    st.markdown("#### Current decision state")
+    route_primary = route.get("primary_result", {})
+    route_saved = route_primary.get("modeled_distance_saved_ft")
+    route_reduction = route_primary.get("modeled_distance_reduction_pct")
+    readiness_summary = readiness.get("summary", {})
+    individual_summary = pilot_decision.get("summary", {})
+    package_summary = package_decision.get("summary", {})
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Production status", readiness.get("status", "unknown"))
+    c2.metric("Readiness checks", f"{int(readiness_summary.get('passed', 0) or 0)}/{int(readiness_summary.get('checks', 0) or 0)}")
+    c3.metric("Modeled route savings", f"{number(route_saved)} ft")
+    c4.metric("Modeled reduction", f"{number(route_reduction, 2)}%")
+    c5.metric("Individual READY", int(individual_summary.get("READY_FOR_CONTROLLED_PILOT", 0) or 0))
+    c6.metric("Package READY", int(package_summary.get("READY_FOR_CONTROLLED_PILOT", 0) or 0))
+
+    if readiness.get("status") == "BLOCKED":
+        st.error(
+            "Production pilot is BLOCKED. Sandbox/model results may be reviewed, but they are not evidence that a real warehouse move is safe or approved."
+        )
+    elif readiness.get("ready_for_read_only_production_pilot"):
+        st.success(
+            "Read-only production-pilot prerequisites are recorded as complete. This still does not authorize inventory movement or Odoo writes."
+        )
+
+    st.markdown("#### Live mapping opportunity context")
+    try:
+        mapping = fetch(base_url, "/api/mapping-priorities", limit=10, source_limit=source_limit, lookback_days=90)
+        mapping_frame = make_frame(mapping.get("areas", []))
+        if mapping_frame.empty:
+            st.info("No mapping-priority areas were returned by the API.")
+        else:
+            preferred = [
+                "rank", "area_complete_name", "opportunity_score", "active_storage_locations",
+                "sku_count", "move_touches", "high_velocity_skus", "tracked_skus", "bom_occurrences",
+            ]
+            columns = [column for column in preferred if column in mapping_frame.columns]
+            st.dataframe(mapping_frame[columns] if columns else mapping_frame, width="stretch", hide_index=True)
+    except ControlTowerAPIError as exc:
+        st.warning(f"Mapping-priority API unavailable: {exc}")
+
+    st.markdown("#### Slotting and route evidence")
+    slotting_summary = slotting.get("summary", {})
+    route_completed = route.get("completed_historical_validation", {})
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("Travel-actionable moves", int(slotting_summary.get("recommendations", 0) or 0))
+    e2.metric("Geometry-only suppressed", int(slotting_summary.get("geometry_only_candidates_suppressed", 0) or 0))
+    e3.metric("Completed modeled pickings", int(route_completed.get("modeled_pickings", 0) or 0))
+    e4.metric("Affected completed pickings", int(route_completed.get("affected_pickings", 0) or 0))
+
+    recommendations = decision_report.get("recommendations") or []
+    if not recommendations:
+        recommendations = pilot_decision.get("decisions") or []
+    if recommendations:
+        st.markdown("##### Individual relocation decisions")
+        frame = make_frame(recommendations)
+        preferred = [
+            "product_code", "source", "candidate", "decision", "capacity_screen_pass",
+            "completed_route_saved_ft", "payback_affected_pickings_at_selected_scenario",
+            "observed_completed_affected_pickings", "reasons",
+        ]
+        columns = [column for column in preferred if column in frame.columns]
+        st.dataframe(frame[columns] if columns else frame, width="stretch", hide_index=True)
+
+    packages = decision_report.get("copick_packages") or package_decision.get("decisions") or []
+    if packages:
+        st.markdown("##### Co-pick package decisions")
+        package_frame = make_frame(packages)
+        preferred = [
+            "package_id", "product_codes", "decision", "shared_joint_route_saved_ft",
+            "package_modeled_route_saved_ft", "payback_affected_pickings_at_selected_scenario",
+            "completed_affected_pickings", "reasons",
+        ]
+        columns = [column for column in preferred if column in package_frame.columns]
+        st.dataframe(package_frame[columns] if columns else package_frame, width="stretch", hide_index=True)
+
+    package_summary_econ = package_economics.get("summary", {})
+    if package_summary_econ:
+        st.caption(
+            "Shared co-pick savings reconciliation: "
+            f"{number(package_summary_econ.get('package_shared_joint_route_saved_ft'))} ft package shared benefit; "
+            f"difference {number(package_summary_econ.get('shared_savings_reconciliation_difference_ft'), 3)} ft."
+        )
+
+    st.markdown("#### Production-readiness gate")
+    checks = readiness.get("checks") or []
+    if checks:
+        check_frame = make_frame(checks)
+        preferred = ["check_id", "passed", "detail", "evidence_reference"]
+        columns = [column for column in preferred if column in check_frame.columns]
+        st.dataframe(check_frame[columns] if columns else check_frame, width="stretch", hide_index=True)
+    else:
+        st.info("No production-readiness artifact is available for this area.")
+
+    st.markdown("#### Production-pilot intake actions")
+    phase_summary = intake.get("phase_summary") or []
+    if phase_summary:
+        phase_frame = make_frame(phase_summary)
+        st.dataframe(phase_frame, width="stretch", hide_index=True)
+
+    intake_items = intake.get("items") or []
+    if intake_items:
+        blocked_only = st.toggle("Show blocked actions only", value=True)
+        rows = [row for row in intake_items if not row.get("passed")] if blocked_only else intake_items
+        action_frame = make_frame(rows)
+        preferred = [
+            "phase", "status", "check_id", "suggested_owner", "required_evidence",
+            "next_action", "current_evidence_reference",
+        ]
+        columns = [column for column in preferred if column in action_frame.columns]
+        st.dataframe(action_frame[columns] if columns else action_frame, width="stretch", hide_index=True)
+    else:
+        st.info("No production-pilot intake packet is available for this area.")
+
+    with st.expander("Artifact and execution guardrails"):
+        st.write(f"Analysis directory: {bundle.get('analysis_dir')}")
+        st.write("Loaded area slug:", bundle.get("area_slug"))
+        st.write("Odoo mutated by artifact loader: No")
+        st.write("Inventory execution authorized: No")
+        for item in readiness.get("guardrails") or []:
+            st.markdown(f"- {item}")
+        for item in intake.get("guardrails") or []:
+            st.markdown(f"- {item}")
+
+
 def render_data_explorer(base_url: str) -> None:
     st.subheader("Odoo Data Explorer")
     st.caption("Read-only inspection of the four Odoo models currently exposed by AWIA.")
@@ -246,7 +417,16 @@ with st.sidebar:
         options=[500, 1000, 2500, 5000, 10000, 20000],
         value=5000,
     )
-    page = st.radio("View", ["Control Tower", "Inventory Health", "Cycle Count Plan", "Data Explorer"])
+    page = st.radio(
+        "View",
+        [
+            "Control Tower",
+            "Inventory Health",
+            "Cycle Count Plan",
+            "Warehouse Optimization",
+            "Data Explorer",
+        ],
+    )
     if st.button("Refresh data", width="stretch"):
         st.cache_data.clear()
         st.rerun()
@@ -261,5 +441,7 @@ elif page == "Inventory Health":
     render_inventory_health(api_url, source_limit)
 elif page == "Cycle Count Plan":
     render_cycle_count_plan(api_url, source_limit)
+elif page == "Warehouse Optimization":
+    render_warehouse_optimization(api_url, source_limit)
 else:
     render_data_explorer(api_url)
