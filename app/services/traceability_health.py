@@ -33,6 +33,20 @@ def _number(value: Any) -> float:
         return 0.0
 
 
+def build_traceability_block_index(report: Record) -> dict[tuple[int, int], dict[str, Any]]:
+    """Index blocked product/location positions for upstream decision gates."""
+    blocks: dict[tuple[int, int], dict[str, Any]] = {}
+    for row in report.get("items") or []:
+        if not row.get("blocked_from_relocation_analysis"):
+            continue
+        product_id = _m2o_id(row.get("product_id"))
+        location_id = _m2o_id(row.get("location_id"))
+        if product_id is None or location_id is None:
+            continue
+        blocks[(product_id, location_id)] = dict(row)
+    return blocks
+
+
 def analyze_traceability_health(
     products: Iterable[Record],
     quants: Iterable[Record],
