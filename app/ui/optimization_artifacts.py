@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping
 
 AREA_SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
@@ -26,6 +26,33 @@ def validate_area_slug(area_slug: str) -> str:
     if not AREA_SLUG_PATTERN.fullmatch(slug):
         raise ValueError("area_slug must contain only lowercase letters, numbers, and single hyphens")
     return slug
+
+
+def logical_area_to_slug(value: Any) -> str:
+    leaf = str(value or "").strip().split("/")[-1]
+    normalized = leaf.replace("_", " ").lower().strip()
+    return "-".join(normalized.split())
+
+
+def match_mapping_area(
+    area_slug: str,
+    mapping_rows: Iterable[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    slug = validate_area_slug(area_slug)
+    matches = [
+        dict(row)
+        for row in mapping_rows
+        if logical_area_to_slug(row.get("logical_area")) == slug
+    ]
+    if not matches:
+        return None
+    matches.sort(
+        key=lambda row: (
+            int(row.get("rank") or 10**9),
+            str(row.get("logical_area") or ""),
+        )
+    )
+    return matches[0]
 
 
 def discover_analysis_areas(analysis_dir: str | Path = "data/analysis") -> list[str]:
