@@ -1,4 +1,7 @@
-from app.services.traceability_health import analyze_traceability_health
+from app.services.traceability_health import (
+    analyze_traceability_health,
+    build_traceability_block_index,
+)
 
 
 def _products():
@@ -105,6 +108,30 @@ def test_location_prefix_limits_scope():
 
     assert result["summary"]["tracked_inventory_positions"] == 1
     assert result["items"][0]["location_name"] == "WH/Stock/A01"
+
+
+def test_block_index_contains_only_blocked_product_location_positions():
+    report = {
+        "items": [
+            {
+                "product_id": 1,
+                "location_id": 10,
+                "blocked_from_relocation_analysis": True,
+                "anonymous_quantity": 7.0,
+            },
+            {
+                "product_id": 2,
+                "location_id": 20,
+                "blocked_from_relocation_analysis": False,
+                "anonymous_quantity": 0.0,
+            },
+        ]
+    }
+
+    index = build_traceability_block_index(report)
+
+    assert set(index) == {(1, 10)}
+    assert index[(1, 10)]["anonymous_quantity"] == 7.0
 
 
 def test_traceability_analysis_never_authorizes_execution():
