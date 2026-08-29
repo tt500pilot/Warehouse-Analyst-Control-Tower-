@@ -13,6 +13,7 @@ from app.services.inventory_health import analyze_inventory_health, build_cycle_
 from app.services.kitting_baseline import analyze_kitting_baseline
 from app.services.kitting_transactions import inspect_kitting_transactions
 from app.services.mapping_prioritizer import analyze_mapping_priorities
+from app.services.traceability_health import analyze_traceability_health
 from odoo_client import OdooClientError, OdooWarehouseClient
 
 logger = logging.getLogger(__name__)
@@ -24,7 +25,7 @@ app = FastAPI(
         "connected to Odoo. Operational mutations remain outside this API until "
         "they are protected by explicit human-in-the-loop approval workflows."
     ),
-    version="0.6.0",
+    version="0.7.0",
 )
 
 ANALYSIS_PRODUCT_FIELDS = (
@@ -228,6 +229,39 @@ def _build_mapping_priority_report(
     return report
 
 
+def _build_traceability_health_report(
+    client: OdooWarehouseClient,
+    *,
+    source_limit: int,
+    location_prefix: str,
+) -> dict[str, Any]:
+    try:
+        products = client.fetch_products(
+            domain=[["active", "=", True]],
+            fields=("id", "default_code", "name", "tracking"),
+            limit=source_limit,
+        )
+        quants = client.fetch_stock_quants(
+            domain=[["quantity", ">", 0]],
+            limit=source_limit,
+        )
+    except OdooClientError as exc:
+        raise _odoo_unavailable(exc) from exc
+
+    report = analyze_traceability_health(
+        products,
+        quants,
+        location_prefix=location_prefix,
+    )
+    report["source_snapshot"] = {
+        "products": len(products),
+        "quants": len(quants),
+        "source_limit_per_model": source_limit,
+        "truncated_possible": any(len(records) >= source_limit for records in (products, quants)),
+    }
+    return report
+
+
 def _build_kitting_baseline_report(
     client: OdooWarehouseClient,
     *,
@@ -416,6 +450,7 @@ def root() -> dict[str, Any]:
             "inventory_health": "/api/inventory-health",
             "cycle_count_plan": "/api/cycle-count-plan",
             "mapping_priorities": "/api/mapping-priorities",
+            "traceability_health": "/api/traceability-health",
             "kitting_baseline": "/api/kitting-baseline",
             "kitting_transactions": "/api/kitting-transactions",
             "docs": "/docs",
@@ -474,6 +509,19 @@ def mapping_priorities(
     report["areas"] = report["areas"][:limit]
     report["returned_areas"] = len(report["areas"])
     return report
+
+
+@app.get("/api/traceability-health", tags=["warehouse", "analytics"])
+def traceability_health(
+    source_limit: int = Query(default=5000, ge=100, le=20000),
+    location_prefix: str = Query(default="", min_length=0, max_length=200),
+    client: OdooWarehouseClient = Depends(get_odoo_client),
+) -> dict[str, Any]:
+    return _build_traceability_health_report(
+        client,
+        source_limit=source_limit,
+        location_prefix=location_prefix,
+    )
 
 
 @app.get("/api/kitting-transactions", tags=["manufacturing", "analytics"])
