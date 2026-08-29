@@ -25,8 +25,8 @@ class FakeOdooClient:
 
     def fetch_stock_quants(self, *, domain=None, fields=None, limit=100):
         records = [
-            {"id": 10, "product_id": [1, "Test Product"], "location_id": [101, "WH/Stock/A-01"], "quantity": 42.0, "reserved_quantity": 2.0},
-            {"id": 11, "product_id": [2, "Second Product"], "location_id": [102, "WH/Stock/B-02"], "quantity": 12.0, "reserved_quantity": 0.0},
+            {"id": 10, "product_id": [1, "Test Product"], "location_id": [101, "WH/Stock/A-01"], "lot_id": False, "quantity": 42.0, "reserved_quantity": 2.0},
+            {"id": 11, "product_id": [2, "Second Product"], "location_id": [102, "WH/Stock/B-02"], "lot_id": False, "quantity": 12.0, "reserved_quantity": 0.0},
         ]
         return records[:limit]
 
@@ -103,6 +103,22 @@ def test_cycle_count_plan_endpoint() -> None:
     assert body["count"] == 2
     assert body["entries"][0]["sequence"] == 1
     assert "analyst approval" in body["execution"]
+
+
+def test_traceability_health_endpoint() -> None:
+    response = client.get(
+        "/api/traceability-health?source_limit=100&location_prefix=WH%2FStock%2FA"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "read_only_traceability_health"
+    assert body["odoo_mutated"] is False
+    assert body["safe_to_execute_inventory_moves"] is False
+    assert body["location_prefix"] == "WH/Stock/A"
+    assert body["summary"]["tracked_inventory_positions"] == 1
+    assert body["summary"]["blocked_positions"] == 1
+    assert body["summary"]["anonymous_quantity"] == 42.0
+    assert body["items"][0]["status"] == "BLOCKED_TRACEABILITY"
 
 
 def test_limit_validation() -> None:
