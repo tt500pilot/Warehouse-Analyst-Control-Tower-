@@ -5,6 +5,8 @@ import pytest
 from app.ui.optimization_artifacts import (
     discover_analysis_areas,
     load_analysis_artifacts,
+    logical_area_to_slug,
+    match_mapping_area,
     validate_area_slug,
 )
 
@@ -18,6 +20,28 @@ def test_validate_area_slug_rejects_path_traversal():
         validate_area_slug("../secrets")
     with pytest.raises(ValueError):
         validate_area_slug("aisle/h")
+
+
+def test_logical_area_to_slug_uses_leaf_name():
+    assert logical_area_to_slug("WH/Stock/AWIA Mock/Aisle H") == "aisle-h"
+
+
+def test_match_mapping_area_uses_logical_area_contract():
+    rows = [
+        {"rank": 1, "logical_area": "WH/Stock/AWIA Mock/Aisle B"},
+        {"rank": 2, "logical_area": "WH/Stock/AWIA Mock/Aisle H"},
+    ]
+
+    match = match_mapping_area("aisle-h", rows)
+
+    assert match is not None
+    assert match["logical_area"] == "WH/Stock/AWIA Mock/Aisle H"
+    assert match["rank"] == 2
+
+
+def test_match_mapping_area_returns_none_when_no_live_area_matches():
+    rows = [{"rank": 1, "logical_area": "WH/Stock/AWIA Mock/Aisle B"}]
+    assert match_mapping_area("aisle-h", rows) is None
 
 
 def test_discover_analysis_areas_uses_readiness_artifact(tmp_path):
