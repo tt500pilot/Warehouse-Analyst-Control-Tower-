@@ -10,7 +10,11 @@ import streamlit as st
 
 from app.ui.api_client import ControlTowerAPIError, get_json
 from app.ui.dataframe import make_frame
-from app.ui.optimization_artifacts import discover_analysis_areas, load_analysis_artifacts
+from app.ui.optimization_artifacts import (
+    discover_analysis_areas,
+    load_analysis_artifacts,
+    match_mapping_area,
+)
 
 
 st.set_page_config(
@@ -56,12 +60,6 @@ def usable_artifact(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("artifact_error"):
         return {}
     return value
-
-
-def location_name_to_area_slug(value: Any) -> str:
-    leaf = str(value or "").strip().split("/")[-1]
-    normalized = leaf.replace("_", " ").lower().strip()
-    return "-".join(normalized.split())
 
 
 def show_connection_banner(base_url: str) -> None:
@@ -291,19 +289,18 @@ def render_warehouse_optimization(base_url: str, source_limit: int) -> None:
     try:
         mapping = fetch(base_url, "/api/mapping-priorities", limit=10, source_limit=source_limit, lookback_days=90)
         mapping_rows = mapping.get("areas", [])
-        for row in mapping_rows:
-            complete_name = row.get("area_complete_name")
-            if location_name_to_area_slug(complete_name) == selected_area:
-                selected_location_prefix = str(complete_name or "")
-                break
+        matched_area = match_mapping_area(selected_area, mapping_rows)
+        if matched_area:
+            selected_location_prefix = str(matched_area.get("logical_area") or "")
 
         mapping_frame = make_frame(mapping_rows)
         if mapping_frame.empty:
             st.info("No mapping-priority areas were returned by the API.")
         else:
             preferred = [
-                "rank", "area_complete_name", "opportunity_score", "active_storage_locations",
-                "sku_count", "move_touches", "high_velocity_skus", "tracked_skus", "bom_occurrences",
+                "rank", "logical_area", "opportunity_score", "storage_locations",
+                "inventory_skus", "move_touches", "high_velocity_skus", "tracked_skus",
+                "bom_component_occurrences",
             ]
             columns = [column for column in preferred if column in mapping_frame.columns]
             st.dataframe(mapping_frame[columns] if columns else mapping_frame, width="stretch", hide_index=True)
