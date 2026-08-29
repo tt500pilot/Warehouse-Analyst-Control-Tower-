@@ -51,7 +51,8 @@ def main() -> None:
             "SANDBOX ONLY: prove AWIA cross-area deployment using the deterministic AWIA Mock fixture. "
             "This runner ranks an area from read-only Odoo data, prepares the normal human-measurement handoff, "
             "then substitutes deterministic mock geometry only because the selected locations are under /AWIA Mock/. "
-            "It validates/imports that synthetic geometry and runs the generic mapped-area decision pipeline."
+            "It validates/imports that synthetic geometry, builds one mapped-area deployment manifest, and runs the "
+            "generic decision pipeline from that manifest."
         )
     )
     parser.add_argument("--area-rank", type=int, default=2)
@@ -188,27 +189,46 @@ def main() -> None:
         ],
     )
 
+    manifest_path = deployment_dir / f"{analysis_slug}-mapped-area-manifest.json"
     _run(
-        "generic mapped-area decision pipeline",
+        "mapped-area deployment manifest build",
         [
             python,
-            str(scripts / "run_mapped_area_decision_pipeline.py"),
-            "--geometry",
-            str(geometry_path),
+            str(scripts / "build_mapped_area_manifest.py"),
             "--area-slug",
             analysis_slug,
-            "--output-dir",
+            "--logical-area",
+            selected_area,
+            "--geometry",
+            str(geometry_path),
+            "--output",
+            str(manifest_path),
+            "--analysis-output-dir",
             str(args.analysis_dir),
             "--lookback-days",
             str(args.lookback_days),
             "--source-limit",
             str(args.source_limit),
+            "--top",
+            "20",
             "--economics-setup-minutes",
             args.economics_setup_minutes,
             "--decision-setup-minutes",
             str(args.decision_setup_minutes),
             "--max-payback-pickings",
             str(args.max_payback_pickings),
+            "--database",
+            str(scan.get("database") or ""),
+        ],
+    )
+
+    _run(
+        "manifest-driven mapped-area decision pipeline",
+        [
+            python,
+            str(scripts / "run_mapped_area_manifest.py"),
+            "--manifest",
+            str(manifest_path),
         ],
     )
 
@@ -231,6 +251,7 @@ def main() -> None:
             "deployment_dir": str(deployment_dir),
             "mock_completed_geometry_intake": str(mock_completed_dir),
             "canonical_geometry": str(geometry_path),
+            "mapped_area_manifest": str(manifest_path),
             "traceability_health": str(traceability_path),
             "pilot_decision": str(decision_path),
             "manager_report_markdown": str(Path(args.analysis_dir) / f"{analysis_slug}-decision-report.md"),
@@ -239,6 +260,7 @@ def main() -> None:
         "guardrails": [
             "This runner is sandbox-only and refuses selected areas outside /AWIA Mock/.",
             "The normal production front half still stops for human field measurement; this runner substitutes deterministic fixture geometry only for software validation.",
+            "The mapped-area decision pipeline is launched from one versioned manifest containing references/settings only; credentials are never stored in it.",
             "Tracked product/location positions with anonymous positive quantity are hard-blocked before target allocation in the generic decision pipeline.",
             "Synthetic geometry, capacities, product metadata, route savings, and decisions must never be represented as Firefly production performance.",
             "No Odoo writes are performed.",
