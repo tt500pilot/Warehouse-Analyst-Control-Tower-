@@ -80,6 +80,7 @@ def analyze_aisle_slotting(
     *,
     bom_lines: Iterable[Record] = (),
     lookback_days: int = 90,
+    traceability_blocks: Mapping[tuple[int, int], Record] | None = None,
 ) -> dict[str, Any]:
     if geometry.get("schema_version") != "awia-warehouse-geometry-v1":
         raise ValueError("Unsupported or missing canonical geometry schema_version")
@@ -90,6 +91,7 @@ def analyze_aisle_slotting(
     quant_rows = list(quants)
     move_rows = list(moves)
     bom_rows = list(bom_lines)
+    traceability_blocks = dict(traceability_blocks or {})
     products_by_id = {
         product_id: row
         for row in product_rows
@@ -121,7 +123,8 @@ def analyze_aisle_slotting(
 
     # Current state from live quants. Positive quantity means the bin was
     # occupied at the beginning of the analysis; those bins are never used as
-    # candidate targets in this conservative first slice.
+    # candidate targets in this conservative first slice. Traceability-blocked
+    # inventory remains part of occupancy and is never made artificially empty.
     by_product_location: dict[int, dict[int, dict[str, float]]] = defaultdict(
         lambda: defaultdict(lambda: {"quantity": 0.0, "reserved": 0.0})
     )
@@ -214,6 +217,7 @@ def analyze_aisle_slotting(
     used_targets: set[int] = set()
     recommendations: list[dict[str, Any]] = []
     not_recommended: list[dict[str, Any]] = []
+    traceability_candidates_suppressed = 0
 
     for profile in profiles:
         positions = profile["positions"]
@@ -228,6 +232,28 @@ def analyze_aisle_slotting(
             continue
         source_position = positions[0]
         source = source_position["location"]
+        source_location_id = int(source["odoo_location_id"])
+        traceability_block = traceability_blocks.get(
+            (int(profile["product_id"]), source_location_id)
+        )
+        if traceability_block:
+            traceability_candidates_suppressed += 1
+            not_recommended.append(
+                {
+                    "product_id": profile["product_id"],
+                    "product_code": profile["product_code"],
+                    "reason": "blocked_traceability",
+                    "source_location_id": source_location_id,
+                    "source_location_name": source.get("complete_name"),
+                    "tracking": profile["tracking"],
+                    "anonymous_quantity": traceability_block.get("anonymous_quantity"),
+                    "traceability_coverage_pct": traceability_block.get("traceability_coverage_pct"),
+                    "traceability_reasons": traceability_block.get("reasons") or [],
+                    "hard_gate": True,
+                }
+            )
+            continue
+
         candidates = [
             target
             for target in available_targets
@@ -340,6 +366,7 @@ def analyze_aisle_slotting(
             "priority_score": "70% relative observed source-to-anchor touch frequency + 20% relative BOM occurrence + 10% relative moved quantity",
             "location_improvement": "candidate must Pareto-dominate source on graph distance, vertical reach, and horizontal access offset; no tradeoff weights are assumed",
             "benefit": "gross independent-touch graph-distance potential; not multi-stop route or labor savings",
+            "traceability_gate": "a tracked product/location with positive anonymous quantity is excluded before target-bin allocation; blocked inventory remains occupied and cannot reserve or consume a candidate target",
         },
         "summary": {
             "mapped_storage_bins": len(location_by_id),
@@ -350,12 +377,16 @@ def analyze_aisle_slotting(
             "gross_independent_touch_distance_potential_ft": round(total_gross, 3),
             "products_with_live_reservations": sum(1 for row in profiles if row["total_reserved_in_scope"] > 0),
             "tracked_products": sum(1 for row in profiles if row["tracking"].lower() in {"lot", "serial"}),
+            "traceability_blocked_positions_configured": len(traceability_blocks),
+            "traceability_candidates_suppressed": traceability_candidates_suppressed,
         },
         "recommendations": recommendations,
         "not_recommended": not_recommended,
         "profiles": profiles,
         "guardrails": [
             "No Odoo writes are performed.",
+            "Tracked product/location positions with anonymous positive quantity are hard-blocked before target allocation.",
+            "Traceability-blocked inventory remains part of occupancy and is not treated as an empty target.",
             "Recommendations do not prove capacity feasibility or relocation economics.",
             "Gross independent-touch distance is not equivalent to actual multi-stop picker-route savings.",
             "Reservations and lot/serial traceability require controlled execution planning.",
