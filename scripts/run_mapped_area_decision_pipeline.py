@@ -29,9 +29,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Run the full read-only AWIA decision pipeline for any already validated canonical mapped-area geometry. "
-            "The runner orchestrates slotting, matched route validation, relocation readiness, individual economics, "
-            "co-pick package economics, individual and package pilot decisions, and manager report generation. "
-            "It does not create geometry and does not write Odoo."
+            "The runner applies traceability before slot allocation, then orchestrates slotting, matched route validation, "
+            "relocation readiness, individual economics, co-pick package economics, individual and package pilot decisions, "
+            "and manager report generation. It does not create geometry and does not write Odoo."
         )
     )
     parser.add_argument("--geometry", required=True)
@@ -65,6 +65,7 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    traceability = output_dir / f"{area_slug}-traceability-health.json"
     slotting = output_dir / f"{area_slug}-slotting.json"
     route = output_dir / f"{area_slug}-route-validation.json"
     readiness = output_dir / f"{area_slug}-relocation-readiness.json"
@@ -78,12 +79,13 @@ def main() -> None:
     python = sys.executable
     scripts = Path(__file__).resolve().parent
 
-    _run("mapped-area slotting analysis", [
+    _run("traceability gate + mapped-area slotting analysis", [
         python, str(scripts / "analyze_mapped_aisle_slotting.py"),
         "--geometry", str(geometry),
         "--lookback-days", str(args.lookback_days),
         "--source-limit", str(args.source_limit),
         "--top", str(args.top),
+        "--traceability-output", str(traceability),
         "--output", str(slotting),
     ])
 
@@ -156,6 +158,8 @@ def main() -> None:
         "--output-json", str(report_json),
     ])
 
+    traceability_payload = json.loads(traceability.read_text(encoding="utf-8"))
+    slotting_payload = json.loads(slotting.read_text(encoding="utf-8"))
     decision_payload = json.loads(decision.read_text(encoding="utf-8"))
     package_payload = json.loads(copick_packages.read_text(encoding="utf-8"))
     package_decision_payload = json.loads(copick_package_decision.read_text(encoding="utf-8"))
@@ -165,10 +169,15 @@ def main() -> None:
         "safe_to_execute": False,
         "area_slug": area_slug,
         "geometry": str(geometry),
+        "traceability_summary": traceability_payload.get("summary") or {},
+        "traceability_candidates_suppressed": int(
+            (slotting_payload.get("summary") or {}).get("traceability_candidates_suppressed", 0) or 0
+        ),
         "individual_decision_summary": decision_payload.get("summary") or {},
         "copick_package_summary": package_payload.get("summary") or {},
         "copick_package_decision_summary": package_decision_payload.get("summary") or {},
         "outputs": {
+            "traceability_health": str(traceability),
             "slotting": str(slotting),
             "route_validation": str(route),
             "relocation_readiness": str(readiness),
@@ -181,6 +190,8 @@ def main() -> None:
         },
         "guardrails": [
             "This runner requires an already validated canonical geometry artifact; it does not infer real warehouse geometry.",
+            "Tracked product/location positions with anonymous positive quantity are excluded before slot target allocation and cannot flow into route/economics/pilot decisions.",
+            "Traceability-blocked inventory remains occupied inventory and is never treated as an available target bin.",
             "The pipeline is advisory/read-only and performs no Odoo writes.",
             "Shared co-pick route benefits are evaluated and decided as packages instead of being arbitrarily allocated to individual SKUs.",
             "READY_FOR_CONTROLLED_PILOT is not execution authorization; human approval remains required.",
