@@ -58,6 +58,12 @@ def usable_artifact(value: Any) -> dict[str, Any]:
     return value
 
 
+def location_name_to_area_slug(value: Any) -> str:
+    leaf = str(value or "").strip().split("/")[-1]
+    normalized = leaf.replace("_", " ").lower().strip()
+    return "-".join(normalized.split())
+
+
 def show_connection_banner(base_url: str) -> None:
     try:
         api_health = fetch(base_url, "/health")
@@ -227,7 +233,7 @@ def render_cycle_count_plan(base_url: str, source_limit: int) -> None:
 def render_warehouse_optimization(base_url: str, source_limit: int) -> None:
     st.subheader("Warehouse Optimization & Production Pilot")
     st.caption(
-        "Manager view of mapping priority, modeled slotting evidence, pilot decisions, and the production-readiness boundary. "
+        "Manager view of mapping priority, modeled slotting evidence, pilot decisions, traceability health, and the production-readiness boundary. "
         "AWIA remains advisory and this page performs no Odoo writes."
     )
 
@@ -281,9 +287,17 @@ def render_warehouse_optimization(base_url: str, source_limit: int) -> None:
         )
 
     st.markdown("#### Live mapping opportunity context")
+    selected_location_prefix = ""
     try:
         mapping = fetch(base_url, "/api/mapping-priorities", limit=10, source_limit=source_limit, lookback_days=90)
-        mapping_frame = make_frame(mapping.get("areas", []))
+        mapping_rows = mapping.get("areas", [])
+        for row in mapping_rows:
+            complete_name = row.get("area_complete_name")
+            if location_name_to_area_slug(complete_name) == selected_area:
+                selected_location_prefix = str(complete_name or "")
+                break
+
+        mapping_frame = make_frame(mapping_rows)
         if mapping_frame.empty:
             st.info("No mapping-priority areas were returned by the API.")
         else:
@@ -295,6 +309,56 @@ def render_warehouse_optimization(base_url: str, source_limit: int) -> None:
             st.dataframe(mapping_frame[columns] if columns else mapping_frame, width="stretch", hide_index=True)
     except ControlTowerAPIError as exc:
         st.warning(f"Mapping-priority API unavailable: {exc}")
+
+    st.markdown("#### Traceability health before relocation analysis")
+    if not selected_location_prefix:
+        st.info(
+            "The selected analysis slug could not be matched to a live Odoo mapping area, so area-scoped traceability was not requested."
+        )
+    else:
+        try:
+            traceability = fetch(
+                base_url,
+                "/api/traceability-health",
+                source_limit=source_limit,
+                location_prefix=selected_location_prefix,
+            )
+            trace_summary = traceability.get("summary", {})
+            t1, t2, t3, t4, t5 = st.columns(5)
+            t1.metric("Traceability coverage", f"{number(trace_summary.get('traceability_coverage_pct'), 2)}%")
+            t2.metric("Tracked positions", int(trace_summary.get("tracked_inventory_positions", 0) or 0))
+            t3.metric("Blocked positions", int(trace_summary.get("blocked_positions", 0) or 0))
+            t4.metric("Blocked products", int(trace_summary.get("blocked_products", 0) or 0))
+            t5.metric("Anonymous tracked qty", number(trace_summary.get("anonymous_quantity"), 1))
+
+            if int(trace_summary.get("blocked_positions", 0) or 0) > 0:
+                st.error(
+                    "Tracked inventory with missing lot/serial identity exists in this mapped area. Those positions are blocked from relocation analysis until reconciled through approved inventory/quality procedures."
+                )
+            else:
+                st.success(
+                    "No anonymous positive on-hand quantity was found for lot/serial-tracked inventory in this mapped area. Reservations and other execution gates still apply."
+                )
+
+            trace_items = traceability.get("items") or []
+            if trace_items:
+                trace_frame = make_frame(trace_items)
+                preferred = [
+                    "status", "product_code", "product_name", "tracking", "location_name",
+                    "on_hand_quantity", "reserved_quantity", "identified_quantity",
+                    "anonymous_quantity", "traceability_coverage_pct", "reasons",
+                ]
+                columns = [column for column in preferred if column in trace_frame.columns]
+                st.dataframe(trace_frame[columns] if columns else trace_frame, width="stretch", hide_index=True)
+
+            trace_source = traceability.get("source_snapshot", {})
+            if trace_source.get("truncated_possible"):
+                st.warning(
+                    "Traceability source data reached the configured source limit. Increase Source rows before treating coverage as complete."
+                )
+            st.caption(f"Traceability scope: `{selected_location_prefix}` • Read-only Odoo analysis")
+        except ControlTowerAPIError as exc:
+            st.warning(f"Traceability-health API unavailable: {exc}")
 
     st.markdown("#### Slotting and route evidence")
     slotting_summary = slotting.get("summary", {})
