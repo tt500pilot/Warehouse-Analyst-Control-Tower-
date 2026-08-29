@@ -8,6 +8,7 @@ from typing import Any, Iterable, Mapping
 AREA_SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 ARTIFACT_SUFFIXES: dict[str, str] = {
+    "traceability_health": "traceability-health.json",
     "slotting": "slotting.json",
     "route_validation": "route-validation.json",
     "relocation_readiness": "relocation-readiness.json",
@@ -106,6 +107,7 @@ def load_analysis_artifacts(
         "guardrails": [
             "Only fixed AWIA analysis artifact suffixes are loaded.",
             "The area slug is validated and cannot contain path separators or traversal segments.",
+            "Mapped-area traceability is loaded from the exact pipeline artifact produced from geometry-scoped Odoo locations.",
             "This loader does not connect to Odoo and performs no writes.",
         ],
     }
