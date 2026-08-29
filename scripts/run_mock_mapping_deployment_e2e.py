@@ -212,7 +212,9 @@ def main() -> None:
         ],
     )
 
+    traceability_path = Path(args.analysis_dir) / f"{analysis_slug}-traceability-health.json"
     decision_path = Path(args.analysis_dir) / f"{analysis_slug}-pilot-decision.json"
+    traceability = json.loads(traceability_path.read_text(encoding="utf-8"))
     decision = json.loads(decision_path.read_text(encoding="utf-8"))
     result = {
         "mode": "sandbox_only_cross_area_deployment_e2e",
@@ -223,11 +225,13 @@ def main() -> None:
         "opportunity_score": selected.get("opportunity_score"),
         "analysis_slug": analysis_slug,
         "anchor_location": anchor_location,
+        "traceability_summary": traceability.get("summary") or {},
         "decision_summary": decision.get("summary") or {},
         "outputs": {
             "deployment_dir": str(deployment_dir),
             "mock_completed_geometry_intake": str(mock_completed_dir),
             "canonical_geometry": str(geometry_path),
+            "traceability_health": str(traceability_path),
             "pilot_decision": str(decision_path),
             "manager_report_markdown": str(Path(args.analysis_dir) / f"{analysis_slug}-decision-report.md"),
             "manager_report_json": str(Path(args.analysis_dir) / f"{analysis_slug}-decision-report.json"),
@@ -235,6 +239,7 @@ def main() -> None:
         "guardrails": [
             "This runner is sandbox-only and refuses selected areas outside /AWIA Mock/.",
             "The normal production front half still stops for human field measurement; this runner substitutes deterministic fixture geometry only for software validation.",
+            "Tracked product/location positions with anonymous positive quantity are hard-blocked before target allocation in the generic decision pipeline.",
             "Synthetic geometry, capacities, product metadata, route savings, and decisions must never be represented as Firefly production performance.",
             "No Odoo writes are performed.",
         ],
