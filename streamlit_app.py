@@ -10,6 +10,7 @@ import streamlit as st
 
 from app.ui.api_client import ControlTowerAPIError, get_json
 from app.ui.dataframe import make_frame
+from app.ui.management_summary import build_optimization_management_summary
 from app.ui.optimization_artifacts import (
     discover_analysis_areas,
     load_analysis_artifacts,
@@ -258,6 +259,25 @@ def render_warehouse_optimization(base_url: str, source_limit: int) -> None:
 
     if bundle.get("missing_artifacts"):
         st.info("Some optional analysis artifacts are not present: " + ", ".join(bundle["missing_artifacts"]))
+
+    management = build_optimization_management_summary(
+        readiness=readiness,
+        route=route,
+        individual_decision=pilot_decision,
+        package_decision=package_decision,
+        intake=intake,
+    )
+    st.markdown("#### Management summary")
+    if readiness.get("status") == "BLOCKED":
+        st.warning(f"**{management['headline']}**")
+    else:
+        st.info(f"**{management['headline']}**")
+    st.markdown(f"**Management decision:** {management['action_status']}")
+    st.write(management["opportunity"])
+    st.write(management["decision"])
+    st.write(management["readiness"])
+    st.markdown(f"**Recommended next step:** {management['next_step']}")
+    st.caption(management["footnote"])
 
     st.markdown("#### Current decision state")
     route_primary = route.get("primary_result", {})
