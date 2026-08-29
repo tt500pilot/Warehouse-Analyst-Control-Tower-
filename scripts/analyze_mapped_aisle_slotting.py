@@ -12,12 +12,28 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from app.services.aisle_slotting import analyze_aisle_slotting
+from app.services.traceability_health import (
+    analyze_traceability_health,
+    build_traceability_block_index,
+)
 from odoo_client import OdooWarehouseClient
 
 
 def _fields(client: OdooWarehouseClient, model: str, wanted: tuple[str, ...]) -> list[str]:
     available = set(client.available_fields(model))
     return [field for field in wanted if field in available]
+
+
+def _m2o_id(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, (list, tuple)) and value:
+        first = value[0]
+        if isinstance(first, int) and not isinstance(first, bool) and first > 0:
+            return int(first)
+    return None
 
 
 def _filter_travel_actionable_recommendations(result: dict[str, Any]) -> None:
@@ -103,6 +119,11 @@ def main() -> None:
         default="",
         help="Optional path to save the full JSON result before top-N display truncation.",
     )
+    parser.add_argument(
+        "--traceability-output",
+        default="",
+        help="Optional path to save the mapped-area traceability health artifact used as the hard upstream gate.",
+    )
     args = parser.parse_args()
     if args.lookback_days <= 0:
         raise ValueError("--lookback-days must be greater than zero")
@@ -184,6 +205,31 @@ def main() -> None:
         order="id asc",
     )
 
+    mapped_location_ids = {
+        int(row["odoo_location_id"])
+        for row in geometry.get("locations", [])
+        if row.get("record_type") == "storage_bin" and row.get("odoo_location_id") is not None
+    }
+    mapped_quants = [
+        row for row in quants if _m2o_id(row.get("location_id")) in mapped_location_ids
+    ]
+    traceability = analyze_traceability_health(products, mapped_quants)
+    traceability["geometry_file"] = str(geometry_path)
+    traceability["mapped_storage_location_ids"] = sorted(mapped_location_ids)
+    traceability["source_snapshot"] = {
+        "products": len(products),
+        "mapped_quants": len(mapped_quants),
+        "source_limit_per_model": args.source_limit,
+        "truncated_possible": len(products) >= args.source_limit or len(quants) >= args.source_limit,
+    }
+    traceability_blocks = build_traceability_block_index(traceability)
+
+    if args.traceability_output.strip():
+        traceability_output = Path(args.traceability_output)
+        traceability_output.parent.mkdir(parents=True, exist_ok=True)
+        traceability_output.write_text(json.dumps(traceability, indent=2), encoding="utf-8")
+        traceability["saved_output"] = str(traceability_output)
+
     result = analyze_aisle_slotting(
         geometry,
         products,
@@ -191,13 +237,22 @@ def main() -> None:
         moves,
         bom_lines=bom_lines,
         lookback_days=args.lookback_days,
+        traceability_blocks=traceability_blocks,
     )
     _filter_travel_actionable_recommendations(result)
     result["database"] = client.database
     result["geometry_file"] = str(geometry_path)
+    result["traceability_gate"] = {
+        "mode": traceability.get("mode"),
+        "summary": traceability.get("summary") or {},
+        "hard_block_count": len(traceability_blocks),
+        "artifact": args.traceability_output.strip() or None,
+        "applied_before_target_allocation": True,
+    }
     result["source_snapshot"] = {
         "products": len(products),
         "quants": len(quants),
+        "mapped_quants": len(mapped_quants),
         "move_lines": len(moves),
         "bom_lines": len(bom_lines),
         "source_limit_per_model": args.source_limit,
